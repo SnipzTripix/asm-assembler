@@ -457,8 +457,12 @@ mov rcx, 0
 movb [r14+53], rcx
 mov rcx, 56
 movb [r14+54], rcx
-mov rcx, 2                          ; e_phnum -- two segments now
-movb [r14+56], rcx
+mov rcx, 2                          ; e_phnum: two segments, unless .data
+cmp rdi, 0                          ; is empty -- then the second PT_LOAD
+jne phnum_two                       ; would describe a zero-length mapping
+mov rcx, 1                          ; and the file would be padded out to a
+phnum_two:                          ; page boundary for nothing (a 1-line
+movb [r14+56], rcx                  ; program used to emit 4096 bytes)
 mov rcx, 0
 movb [r14+57], rcx
 movb [r14+58], rcx
@@ -536,6 +540,12 @@ syscall
 cmp rax, 0
 jl die_write
 
+; An empty .data needs neither the alignment padding nor a data write --
+; without this the output of every section-less program was rounded up to
+; a full page of mostly zeros.
+cmp r10, 0
+je write_done
+
 mov rdx, r8
 sub rdx, r9                         ; padding_size = DATA_FILE_START - text_size
 mov rsi, r14
@@ -558,6 +568,7 @@ mov rax, SYS_write
 syscall
 cmp rax, 0
 jl die_write
+write_done:
 
 ; --- close whichever fds we actually opened (argv-provided ones only --
 ; the stdin/stdout defaults are left alone) ---
