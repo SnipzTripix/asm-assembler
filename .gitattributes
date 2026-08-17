@@ -1,0 +1,11 @@
+# The shell scripts and .v0 sources are consumed by Linux (WSL); CRLF
+# would break the scripts' shebangs outright. Force LF regardless of
+# core.autocrlf on the checkout side.
+*.sh   text eol=lf
+*.v0   text eol=lf
+*.asm  text eol=lf
+*.md   text eol=lf
+
+# v1 and seed/seed are real executables, not text -- never touch them.
+v1        binary
+seed/seed binary

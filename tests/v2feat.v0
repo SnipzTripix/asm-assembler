@@ -1,0 +1,81 @@
+; v2feat.v0 -- exercises equ, reg,imm arith, bitwise, shifts, movb, new jcc
+SYS_write equ 1
+SYS_exit equ 60
+MASK equ 0xFF
+
+mov rbp, rsp
+mov rcx, 32
+sub rsp, rcx
+
+; --- reg,imm arithmetic + equ-constant-as-immediate ---
+mov rax, 10
+add rax, 5          ; 15
+sub rax, 3           ; 12
+cmp rax, 12
+jne fail
+
+; --- bitwise reg,reg and reg,imm ---
+mov rax, 0xF0
+mov rbx, 0x0F
+or rax, rbx           ; 0xFF
+and rax, MASK          ; 0xFF (equ const as imm)
+cmp rax, 0xFF
+jne fail
+xor rax, rax            ; 0
+cmp rax, 0
+jne fail
+
+; --- shifts ---
+mov rax, 1
+shl rax, 4              ; 16
+cmp rax, 16
+jne fail
+shr rax, 2                ; 4
+cmp rax, 4
+jne fail
+
+; --- movb byte load/store ---
+mov [rbp-8], rax           ; scratch qword, will overwrite low byte only
+mov rax, 65                  ; 'A'
+movb [rbp-8], rax
+movb rbx, [rbp-8]
+cmp rbx, 65
+jne fail
+
+; --- unsigned/extra signed jcc ---
+mov rax, 5
+mov rcx, 3
+cmp rax, rcx
+jle fail
+jg ok1
+jmp fail
+ok1:
+cmp rcx, rax
+jae fail
+jb ok2
+jmp fail
+ok2:
+
+mov rax, 1
+mov rdi, 1
+mov rsi, okmsg
+mov rdx, 3
+syscall
+mov rax, SYS_exit
+mov rdi, 0
+syscall
+
+fail:
+mov rax, 1
+mov rdi, 2
+mov rsi, failmsg
+mov rdx, 5
+syscall
+mov rax, SYS_exit
+mov rdi, 1
+syscall
+
+okmsg:
+db "ok\n"
+failmsg:
+db "FAIL\n"

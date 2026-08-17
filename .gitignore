@@ -1,0 +1,9 @@
+# Build/test scratch. The committed `v1` and `seed/seed` binaries are
+# deliberately NOT ignored: `v1.v0` can only be assembled by an existing
+# `v1`, so the binary is the bootstrap artifact, not a build product.
+*.o
+*.lst
+v1_next
+v1_gen*
+*.out
+*.bin

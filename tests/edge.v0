@@ -1,0 +1,7 @@
+; comments and blank lines around real statements
+
+mov rax, 60   ; sys_exit
+
+mov rdi, 7
+; trailing comment line
+syscall

@@ -1,0 +1,14 @@
+; mmap_small.v0 -- same as mmap_big.v0 but reserving 1 MiB instead of
+; 216 MiB. Any timing difference between the two is the cost of the
+; larger reservation alone.
+mov rdi, 0
+mov rsi, 0x100000
+mov rdx, 3
+mov r10, 0x22
+mov r8, 0xFFFFFFFFFFFFFFFF
+mov r9, 0
+mov rax, 9
+syscall
+mov rdi, 0
+mov rax, 60
+syscall

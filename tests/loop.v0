@@ -1,0 +1,45 @@
+; loop.v0 -- exercises labels, jl/cmp loop, mem store/load, push/pop, call/ret.
+; Prints "hi\n" three times via a subroutine, using [rbp-8] as a counter
+; slot (no real stack frame needed for our purposes -- just a scratch cell).
+mov rbp, rsp          ; rbp = current stack pointer, for [rbp-8] scratch
+mov rcx, 32
+sub rsp, rcx           ; reserve 32B below rbp -- otherwise call's own
+                       ; return-address push lands on [rbp-8] and clobbers it
+mov rax, 0
+mov [rbp-8], rax       ; counter = 0
+
+loop_top:
+mov rax, [rbp-8]
+mov rcx, 3
+cmp rax, rcx
+jge loop_end
+
+call print_hi
+
+mov rax, [rbp-8]
+mov rcx, 1
+add rax, rcx
+mov [rbp-8], rax
+jmp loop_top
+
+loop_end:
+mov rax, 60
+mov rdi, 0
+syscall
+
+print_hi:
+push rax
+push rcx
+push rdx
+mov rax, 1
+mov rdi, 1
+mov rsi, msg
+mov rdx, 4              ; "hi\n" is 4 literal bytes: h,i,\,n (no escapes)
+syscall
+pop rdx
+pop rcx
+pop rax
+ret
+
+msg:
+db "hi\n"

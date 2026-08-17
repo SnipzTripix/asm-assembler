@@ -1,0 +1,3857 @@
+; ===========================================================================
+; v1.v0 -- self-hosting assembler. Assembled by itself:
+;   ./v1 v1.v0 v1_next && cmp v1 v1_next
+; (byte-identical -- this is the project's own fixed-point test, satisfied.)
+; Takes filenames as argv[1]/argv[2] (output gets mode 0755, no separate
+; chmod needed); either or both can be omitted, falling back to stdin/
+; stdout, so `./v1 < in > out` keeps working exactly as it always did.
+; seed.asm/seed is retired: it only exists to have bootstrapped this file
+; once, and is kept around for the historical record and its differential
+; test against nasm, not because anything still depends on it.
+;
+; History: started as a from-scratch reimplementation of seed's logic
+; (not a byte-for-byte port) with a trimmed jcc set (je/jne/jl/jae) and no
+; lea/test/neg/imul/cmpsb, since none of those existed in the dialect it
+; itself implemented at the time. It has since grown past that minimum:
+; lea, imul (reg,reg), general negative immediates, a SWAR+bucketed
+; mnemonic dispatch, a branchless 256-byte char-class table, an
+; FNV-1a-hashed open-addressed symbol table (replaced a linear scan that
+; was the actual bottleneck: 55x slower on a 100k-line file with 10,000
+; labels, measured, before the fix), and real .text/.data sections (two
+; separate PT_LOAD segments, R+X and R, instead of one flat R+X blob) --
+; each re-verified against nasm (tests/) and against the fixed-point
+; check above before being kept. test/neg/rep-cmpsb are still absent --
+; their workarounds (cmp+jl for test, mov-0/sub for neg, a hand-rolled
+; byte loop for string compare) are cheap enough that adding the real
+; instructions hasn't been worth it.
+;
+; Register contract (rbx=mmap base, r12=input end, r13=cursor, r14=text
+; buffer base, r15=output bump pointer -- into whichever section is
+; currently active, see .text/.data below) matches seed's, kept for
+; familiarity -- not required by the dialect itself.
+;
+; Currently supported: mov (imm64/reg/load/store/label-or-const) / movb
+; movw movd (8/16/32-bit load(+zero-extend)/store, mirroring movb; movd's
+; load needs no explicit zero-extend opcode -- any 32-bit register write
+; already clears the upper 32 bits in long mode) / lea / imul (reg,reg
+; only, no imm form) / add sub and or xor cmp test (reg,reg and reg,imm
+; for the arithmetic ones -- test is reg,reg only -- imm may be negative)
+; / neg / shl shr (imm8 or const, unsigned only) / push pop / jmp je jne
+; jl jae call / ret / syscall / db (string or byte, byte value unsigned
+; only) / equ (value must be a non-negative literal; may be referenced
+; before its definition by `mov reg, NAME`, but not by an arithmetic
+; operand, which resolves constants immediately) / labels / .text /.data
+; (switches which buffer subsequent statements append to; defaults to
+; .text, so source that never mentions either -- everything written
+; before this feature existed -- behaves unchanged). Also takes filenames
+; as argv[1]/argv[2] (output gets mode 0755), falling back to
+; stdin/stdout when either is omitted.
+;
+; Range checking: values that cannot fit the field they are headed for
+; are hard errors ("immediate out of range", "displacement out of
+; range"), never silently truncated -- the imm32 of an 81 /digit
+; arithmetic form, the disp32 of a memory operand, and the 64-bit
+; accumulator in parse_imm are all checked. This matters more than it
+; sounds: every one of those silently produced a wrong encoding at some
+; point, which is the single worst failure mode an assembler has.
+;
+; NOT implemented, i.e. what "grow the dialect further" still means here:
+; imul reg,imm, test reg,imm, .bss (no uninitialized-space directive;
+; write explicit zero bytes into .data instead), arithmetic at anything
+; but 64 bits (movw/movd cover memory access; add/sub/cmp/etc are still
+; always full-width), scaled-index / RIP-relative addressing, short
+; (rel8) jump encoding, escape sequences in db strings ("\n" is a
+; literal backslash followed by n -- emit byte 10 with `db 10` instead).
+; Mnemonic dispatch
+; is SWAR (masked-qword compare, see PACK_* below) + bucketed by first
+; letter; a real function-pointer table would need `dq label` support
+; this dialect still doesn't have.
+; ===========================================================================
+
+; --- syscall numbers / mmap flags ---
+SYS_read        equ 0
+SYS_write       equ 1
+SYS_open        equ 2
+SYS_close       equ 3
+SYS_mmap        equ 9
+SYS_exit        equ 60
+O_RDONLY        equ 0
+O_WRONLY_CREAT_TRUNC equ 577       ; O_WRONLY(1)|O_CREAT(64)|O_TRUNC(512)
+MODE_755        equ 493            ; rwxr-xr-x
+PROT_RW         equ 3
+MAP_ANON        equ 0x22
+
+; --- memory layout: one mmap, several regions, fixed offsets from rbx ---
+; Sized for the spec's own 100k-line benchmark target (a few MB of source
+; is common well before that): 64MB each for in/text/data, 16MB symtab
+; (an open-addressed hash table -- see fnv1a/find_or_create_symbol --
+; SYM_CAP must stay a power of 2 so probing can mask instead of mod), 8MB
+; fixups (still a plain append-only array; fixups are only ever scanned
+; once, in order, at the end, so they were never the bottleneck). The
+; read loop used to stop silently once a 64KB buffer filled, truncating
+; the file mid-statement and reporting a confusing "bad operand" at the
+; cut point instead of a real "input too large" -- see read_loop's
+; overflow check, which now makes that failure mode impossible instead
+; of just less likely.
+;
+; .text/.data (see do_section) are two separate buffers, not one split
+; later: a label's value is only meaningful as "offset from MY section's
+; base" until resolve_fixups learns the final text size and can compute
+; where .data actually lands in the output file (single-pass -- data's
+; file position isn't knowable before the whole source has been scanned).
+; r15 (the output bump pointer) always points into whichever buffer is
+; currently active; every emit_*/do_* routine that writes through it is
+; completely unaware sections exist. Only label-value computation, fixup
+; creation, section switching, and the final resolve+write step know.
+BUF_LEN         equ 0x4000000            ; 64 MiB input capacity
+TEXTBUF_OFF     equ 0x4000000            ; 64 MiB text capacity
+DATABUF_OFF     equ 0x8000000            ; 64 MiB data capacity
+SYMTAB_META_OFF equ 0xC000000
+SYMTAB_OFF      equ 0xC000008
+FIXUPS_META_OFF equ 0xD000000            ; + 16MB symtab region
+FIXUPS_OFF      equ 0xD000008
+LINE_OFF        equ 0xD800000            ; + 8MB fixups region
+CUR_SECTION_OFF equ 0xD800008            ; 0 = text (default), 1 = data
+SAVED_TEXT_R15_OFF equ 0xD800010         ; the OTHER section's cursor,
+SAVED_DATA_R15_OFF equ 0xD800018         ; while it isn't the active one
+DATA_FILE_START_OFF equ 0xD800020        ; set once by resolve_fixups
+INPUT_FD_OFF    equ 0xD800028            ; argv[1]-opened fd, else 0 (stdin)
+OUTPUT_FD_OFF   equ 0xD800030            ; argv[2]-opened fd, else 1 (stdout)
+MMAP_TOTAL      equ 0xD800038
+HDR_LEN         equ 176                  ; Ehdr(64) + 2 * Phdr(56) -- one
+                                         ; PT_LOAD each for text (R+X) and
+                                         ; data (R)
+PAGE_SIZE       equ 0x1000
+PAGE_MASK       equ 0xFFFFFFFFFFFFF000   ; low32 0xFFFFF000 sign-extends
+                                         ; back to this exact 64-bit
+                                         ; pattern -- same trick as
+                                         ; NEG_ONE/MMAP_ERR_THRESH below
+FIX_REL32       equ 0
+FIX_ABS64       equ 1
+FIX_ENT         equ 32                  ; power of 2 -- v1 has no div, so
+                                         ; every table stride here is shl-able
+                                         ; {patch_off:8, sym_addr:8, kind:8,
+                                         ; section:8} -- exactly 32B, no pad
+SYM_ENT         equ 64                  ; power of 2 slot stride: {hash:8,
+                                         ; name_ptr:8, name_len:8, value:8,
+                                         ; status:8, section:8, 16B pad}
+SYM_CAP         equ 262144              ; power of 2 -- and'd, never mod'd
+SYM_CAP_MASK    equ 262143
+SEC_TEXT        equ 0
+SEC_DATA        equ 1
+SYM_POP_MAX     equ 229376              ; 7/8 of SYM_CAP -- open addressing
+                                         ; degrades well before 100% full,
+                                         ; and refusing new symbols past
+                                         ; this keeps the probe loop below
+                                         ; bounded instead of risking an
+                                         ; unterminated scan on a full table
+FIX_CAP         equ 200000
+REG_ENT_LEN     equ 11
+LOAD_BASE       equ 0x400000
+FNV_OFFSET      equ 0xCBF29CE484222325
+FNV_PRIME       equ 0x100000001B3
+
+; --- sentinels / two's-complement constants (dialect has no negative
+; immediates; grp1-imm ops truncate to 32 bits and the CPU sign-extends at
+; run time, so writing the full 64-bit two's-complement pattern here is
+; correct for both mov (which keeps all 64 bits) and cmp (which keeps only
+; the low 32, then the CPU re-extends them identically) ---
+NEG_ONE         equ 0xFFFFFFFFFFFFFFFF
+MMAP_ERR_THRESH equ 0xFFFFFFFFFFFFF001
+
+; --- ASCII codes (dialect has no character-literal syntax) ---
+CLS_SPACE       equ 1
+CLS_NL          equ 2
+CLS_ISTART      equ 4
+CLS_ICONT       equ 8
+CLS_DIGIT       equ 16
+CLS_HEX         equ 32
+
+CH_TAB          equ 9
+CH_NL           equ 10
+CH_SPACE        equ 32
+CH_QUOTE        equ 34
+CH_DOT          equ 46
+CH_PLUS         equ 43
+CH_COMMA        equ 44
+CH_MINUS        equ 45
+CH_0            equ 48
+CH_9PLUS1       equ 58
+CH_COLON        equ 58
+CH_SEMI         equ 59
+CH_A            equ 65
+CH_ZPLUS1       equ 91
+CH_LBRACKET     equ 91
+CH_RBRACKET     equ 93
+CH_US           equ 95
+CH_a            equ 97
+CH_x            equ 120
+CH_zPLUS1       equ 123
+CH_fPLUS1       equ 103
+
+; --- SWAR-packed mnemonics (little-endian bytes packed into one qword;
+; generated mechanically, see tests/, not hand-transposed): a masked
+; single-register compare replaces a byte-loop per candidate mnemonic ---
+PACK_MOV        equ 0x766F6D
+PACK_MOVB       equ 0x62766F6D
+PACK_MOVW       equ 0x77766F6D
+PACK_MOVD       equ 0x64766F6D
+PACK_SYSCALL    equ 0x6C6C6163737973
+PACK_RET        equ 0x746572
+PACK_DB         equ 0x6264
+PACK_ADD        equ 0x646461
+PACK_SUB        equ 0x627573
+PACK_AND        equ 0x646E61
+PACK_OR         equ 0x726F
+PACK_XOR        equ 0x726F78
+PACK_CMP        equ 0x706D63
+PACK_SHL        equ 0x6C6873
+PACK_SHR        equ 0x726873
+PACK_JMP        equ 0x706D6A
+PACK_JE         equ 0x656A
+PACK_JNE        equ 0x656E6A
+PACK_JL         equ 0x6C6A
+PACK_JAE        equ 0x65616A
+PACK_CALL       equ 0x6C6C6163
+PACK_PUSH       equ 0x68737570
+PACK_POP        equ 0x706F70
+PACK_LEA        equ 0x61656C
+PACK_IMUL       equ 0x6C756D69
+PACK_TEXT       equ 0x74786574
+PACK_DATA       equ 0x61746164
+PACK_TEST       equ 0x74736574
+PACK_NEG        equ 0x67656E
+
+; ===========================================================================
+; entry point -- mmap the working set, read all of stdin, parse, resolve
+; fixups, build the output ELF header, write it out, exit.
+; ===========================================================================
+start:
+; --- optional argv[1]/argv[2] as input/output filenames, read before any
+; push/call shifts rsp away from the exact SysV entry layout: [rsp]=argc,
+; [rsp+8]=argv[0], [rsp+16]=argv[1], [rsp+24]=argv[2]. Falls back to
+; stdin/stdout (fd 0/1) when the corresponding arg is absent, so
+; `./v1 < in > out` keeps working unchanged. r13/r14 are free to use as
+; temporaries here -- their permanent roles (cursor, text base) aren't
+; assigned until after mmap below, well after these fds are stashed into
+; memory.
+mov r13, 0                          ; input_fd, default stdin
+mov r14, 1                          ; output_fd, default stdout
+mov rax, [rsp+0]                    ; argc
+cmp rax, 2
+jl start_check_output
+mov rdi, [rsp+16]                   ; argv[1]
+mov rsi, O_RDONLY
+mov rax, SYS_open
+syscall
+cmp rax, 0
+jl die_open
+mov r13, rax
+start_check_output:
+mov rax, [rsp+0]                    ; reload argc -- open's return value
+                                    ; just clobbered rax
+cmp rax, 3
+jl start_argv_done
+mov rdi, [rsp+24]                   ; argv[2]
+mov rsi, O_WRONLY_CREAT_TRUNC
+mov rdx, MODE_755
+mov rax, SYS_open
+syscall
+cmp rax, 0
+jl die_open
+mov r14, rax
+start_argv_done:
+
+mov rdi, 0
+mov rsi, MMAP_TOTAL
+mov rdx, PROT_RW
+mov r10, MAP_ANON
+mov r8, NEG_ONE
+mov r9, 0
+mov rax, SYS_mmap
+syscall
+cmp rax, MMAP_ERR_THRESH
+jae die_mmap
+mov rbx, rax
+
+mov rax, rbx
+add rax, INPUT_FD_OFF
+mov [rax+0], r13
+mov rax, rbx
+add rax, OUTPUT_FD_OFF
+mov [rax+0], r14
+
+mov r14, rbx
+add r14, TEXTBUF_OFF             ; r14 = text buffer base, constant for
+                                 ; the whole run (data's base is always
+                                 ; just rbx+DATABUF_OFF, computed inline
+                                 ; wherever needed -- not worth its own
+                                 ; register)
+
+mov r12, 0
+read_loop:
+mov rdi, rbx
+add rdi, r12
+mov rsi, rdi
+mov rdx, BUF_LEN
+sub rdx, r12
+cmp rdx, 0
+je read_check_overflow
+mov rdi, rbx
+add rdi, INPUT_FD_OFF
+mov rdi, [rdi+0]
+mov rax, SYS_read
+syscall
+cmp rax, 0
+jl die_read
+je read_done
+add r12, rax
+jmp read_loop
+read_check_overflow:
+; inbuf is exactly full -- probe for one more byte so a file bigger than
+; BUF_LEN fails cleanly instead of silently truncating mid-statement
+mov rdi, rbx
+add rdi, INPUT_FD_OFF
+mov rdi, [rdi+0]
+mov rsi, rsp
+sub rsi, 64
+mov rdx, 1
+mov rax, SYS_read
+syscall
+cmp rax, 0
+jl die_read
+cmp rax, 0
+jne die_input_too_large        ; not negative and not zero -> read a real
+                               ; byte -- input didn't fit in BUF_LEN
+read_done:
+add r12, rbx
+mov r13, rbx
+mov r15, r14
+add r15, HDR_LEN
+mov rax, rbx
+add rax, LINE_OFF
+mov rcx, 1
+mov [rax+0], rcx
+
+; --- section state: start in .text, remember both cursors ---
+mov rax, rbx
+add rax, CUR_SECTION_OFF
+mov rcx, SEC_TEXT
+mov [rax+0], rcx
+mov rax, rbx
+add rax, SAVED_TEXT_R15_OFF
+mov [rax+0], r15
+mov rax, rbx
+add rax, SAVED_DATA_R15_OFF
+mov rcx, rbx
+add rcx, DATABUF_OFF
+mov [rax+0], rcx
+
+stmt_loop:
+cmp r13, r12
+jae parse_done
+call skip_ws
+cmp r13, r12
+jae parse_done
+movb rax, [r13+0]
+cmp rax, CH_NL
+je blank_line
+cmp rax, CH_SEMI
+je comment_line
+call parse_stmt
+jmp stmt_loop
+blank_line:
+add r13, 1
+mov rax, rbx
+add rax, LINE_OFF
+mov rcx, [rax+0]
+add rcx, 1
+mov [rax+0], rcx
+jmp stmt_loop
+comment_line:
+call skip_to_eol
+jmp stmt_loop
+parse_done:
+call resolve_fixups                 ; also finalizes both section sizes
+                                    ; and DATA_FILE_START -- read those
+                                    ; back out instead of trusting live
+                                    ; r15, which may currently be in
+                                    ; whichever section wasn't scanned last
+
+mov rax, rbx
+add rax, SAVED_TEXT_R15_OFF
+mov rax, [rax+0]
+sub rax, r14                        ; rax = text_size (header + text)
+mov rsi, rax                        ; keep it -- needed for the write step
+mov rax, rbx
+add rax, SAVED_DATA_R15_OFF
+mov rax, [rax+0]
+mov rcx, rbx
+add rcx, DATABUF_OFF
+sub rax, rcx                        ; rax = data_size
+mov rdi, rax                        ; keep it too
+mov rax, rbx
+add rax, DATA_FILE_START_OFF
+mov rax, [rax+0]                    ; rax = DATA_FILE_START (page-aligned)
+
+; --- build the ELF header for the OUTPUT program into r14[0..HDR_LEN) ---
+; Elf64_Ehdr byte offsets: 0 ident[16] 16 type 18 machine 20 version
+;   24 entry 32 phoff 40 shoff 48 flags 52 ehsize 54 phentsize 56 phnum
+;   58 shentsize 60 shnum 62 shstrndx                    (total 64)
+; Elf64_Phdr (56B each, two of them now: text R+X at 64, data R at 120).
+; byte offsets within a Phdr: 0 type 4 flags 8 offset 16 vaddr 24 paddr
+; 32 filesz 40 memsz 48 align
+; v0.2's mov is always a full 8-byte store, so every field narrower than a
+; qword goes through movb one byte at a time here -- packing several
+; fields into one qword write (as seed.asm's nasm-level `mov word`/`mov
+; dword` do) would silently overwrite whatever comes right after it.
+; rax/rsi/rdi (DATA_FILE_START/text_size/data_size) survive throughout:
+; nothing below touches them except where a fresh `mov rax,` is shown.
+mov rcx, 127
+movb [r14+0], rcx
+mov rcx, 69
+movb [r14+1], rcx
+mov rcx, 76
+movb [r14+2], rcx
+mov rcx, 70
+movb [r14+3], rcx
+mov rcx, 2
+movb [r14+4], rcx
+mov rcx, 1
+movb [r14+5], rcx
+movb [r14+6], rcx
+mov rcx, 0
+movb [r14+7], rcx
+mov [r14+8], rcx
+
+mov rcx, 2
+movb [r14+16], rcx
+mov rcx, 0
+movb [r14+17], rcx
+mov rcx, 62
+movb [r14+18], rcx
+mov rcx, 0
+movb [r14+19], rcx
+mov rcx, 1
+movb [r14+20], rcx
+mov rcx, 0
+movb [r14+21], rcx
+movb [r14+22], rcx
+movb [r14+23], rcx
+
+mov rcx, LOAD_BASE
+add rcx, HDR_LEN
+mov [r14+24], rcx
+mov rcx, 64
+mov [r14+32], rcx
+mov rcx, 0
+mov [r14+40], rcx
+
+movb [r14+48], rcx
+movb [r14+49], rcx
+movb [r14+50], rcx
+movb [r14+51], rcx
+mov rcx, 64
+movb [r14+52], rcx
+mov rcx, 0
+movb [r14+53], rcx
+mov rcx, 56
+movb [r14+54], rcx
+mov rcx, 2                          ; e_phnum -- two segments now
+movb [r14+56], rcx
+mov rcx, 0
+movb [r14+57], rcx
+movb [r14+58], rcx
+movb [r14+59], rcx
+movb [r14+60], rcx
+movb [r14+61], rcx
+movb [r14+62], rcx
+movb [r14+63], rcx
+
+; Phdr #1: text, R+X, at file offset 0
+mov rcx, 1
+movb [r14+64], rcx
+mov rcx, 0
+movb [r14+65], rcx
+movb [r14+66], rcx
+movb [r14+67], rcx
+mov rcx, 5
+movb [r14+68], rcx
+mov rcx, 0
+movb [r14+69], rcx
+movb [r14+70], rcx
+movb [r14+71], rcx
+
+mov rcx, 0
+mov [r14+72], rcx                   ; p_offset
+mov rcx, LOAD_BASE
+mov [r14+80], rcx                   ; p_vaddr
+mov [r14+88], rcx                   ; p_paddr
+mov [r14+96], rsi                   ; p_filesz = text_size
+mov [r14+104], rsi                  ; p_memsz
+mov rcx, 4096
+mov [r14+112], rcx                  ; p_align
+
+; Phdr #2: data, R only, at the page-aligned DATA_FILE_START
+mov rcx, 1
+movb [r14+120], rcx
+mov rcx, 0
+movb [r14+121], rcx
+movb [r14+122], rcx
+movb [r14+123], rcx
+mov rcx, 4                          ; PF_R only -- no X, no W
+movb [r14+124], rcx
+mov rcx, 0
+movb [r14+125], rcx
+movb [r14+126], rcx
+movb [r14+127], rcx
+
+mov [r14+128], rax                  ; p_offset = DATA_FILE_START
+mov rcx, LOAD_BASE
+add rcx, rax
+mov [r14+136], rcx                  ; p_vaddr
+mov [r14+144], rcx                  ; p_paddr
+mov [r14+152], rdi                  ; p_filesz = data_size
+mov [r14+160], rdi                  ; p_memsz
+mov rcx, 4096
+mov [r14+168], rcx                  ; p_align
+
+; --- write the output image: header+text, then zero padding up to the
+; page boundary (sourced from r14 past text_size, which is guaranteed
+; zero -- fresh mmap, never written past there), then data. A syscall
+; only clobbers rax/rcx/r11 -- rdi/rsi/rdx/r8/r9/r10 all survive it, so
+; DATA_FILE_START/text_size/data_size move into r8/r9/r10 once, up front,
+; instead of being re-derived (or worse, lost) between the three writes.
+mov r8, rax                         ; r8 = DATA_FILE_START
+mov r9, rsi                         ; r9 = text_size
+mov r10, rdi                        ; r10 = data_size
+
+mov rdx, r9
+mov rsi, r14
+mov rdi, rbx
+add rdi, OUTPUT_FD_OFF
+mov rdi, [rdi+0]
+mov rax, SYS_write
+syscall
+cmp rax, 0
+jl die_write
+
+mov rdx, r8
+sub rdx, r9                         ; padding_size = DATA_FILE_START - text_size
+mov rsi, r14
+add rsi, r9                         ; source = r14+text_size (zero there)
+mov rdi, rbx
+add rdi, OUTPUT_FD_OFF
+mov rdi, [rdi+0]
+mov rax, SYS_write
+syscall
+cmp rax, 0
+jl die_write
+
+mov rdx, r10
+mov rsi, rbx
+add rsi, DATABUF_OFF
+mov rdi, rbx
+add rdi, OUTPUT_FD_OFF
+mov rdi, [rdi+0]
+mov rax, SYS_write
+syscall
+cmp rax, 0
+jl die_write
+
+; --- close whichever fds we actually opened (argv-provided ones only --
+; the stdin/stdout defaults are left alone) ---
+mov rax, rbx
+add rax, INPUT_FD_OFF
+mov rax, [rax+0]
+cmp rax, 0
+je close_input_skip
+mov rdi, rax
+mov rax, SYS_close
+syscall
+close_input_skip:
+mov rax, rbx
+add rax, OUTPUT_FD_OFF
+mov rax, [rax+0]
+cmp rax, 1
+je close_output_skip
+mov rdi, rax
+mov rax, SYS_close
+syscall
+close_output_skip:
+
+mov rdi, 0
+mov rax, SYS_exit
+syscall
+
+; ===========================================================================
+; skip_ws -- advance r13 past spaces/tabs only (not newline)
+; ===========================================================================
+skip_ws:
+cmp r13, r12
+jae skip_ws_ret
+movb rax, [r13+0]
+push rdx                            ; many callers hold live state in rdx
+mov rdx, class_tbl                  ; across a skip_ws call (the old,
+add rdx, rax                        ; pre-table skip_ws never touched it,
+movb rdx, [rdx+0]                   ; so nothing preserved it explicitly)
+and rdx, CLS_SPACE
+cmp rdx, 0
+pop rdx
+je skip_ws_ret
+add r13, 1
+jmp skip_ws
+skip_ws_ret:
+ret
+
+; ===========================================================================
+; skip_to_eol -- advance r13 to '\n' (consumed) or end of input
+; ===========================================================================
+skip_to_eol:
+cmp r13, r12
+jae skip_to_eol_ret
+movb rax, [r13+0]
+add r13, 1
+cmp rax, CH_NL
+jne skip_to_eol
+push rax
+mov rax, rbx
+add rax, LINE_OFF
+mov rcx, [rax+0]
+add rcx, 1
+mov [rax+0], rcx
+pop rax
+skip_to_eol_ret:
+ret
+
+; ===========================================================================
+; scan_ident -- scan [A-Za-z0-9_]+ at r13
+;   out: rsi = start, rcx = length; r13 advanced past it
+; ===========================================================================
+scan_ident:
+mov rsi, r13
+scan_ident_loop:
+cmp r13, r12
+jae scan_ident_done
+movb rax, [r13+0]
+push rdx                            ; same rdx-preservation concern as
+mov rdx, class_tbl                  ; skip_ws -- see its comment
+add rdx, rax
+movb rdx, [rdx+0]
+and rdx, CLS_ICONT
+cmp rdx, 0
+pop rdx
+je scan_ident_done
+add r13, 1
+jmp scan_ident_loop
+scan_ident_done:
+mov rcx, r13
+sub rcx, rsi
+ret
+
+; ===========================================================================
+; bytes_eq -- in: rsi/rcx = candidate ptr/len, rdi/rdx = literal ptr/len
+;   out: rax = 1 if equal, 0 if not. Byte-at-a-time via movb (the dialect
+;   has no rep/cmpsb). Only rax is genuinely clobbered -- r8-r11 are saved
+;   and restored internally, so callers (parse_reg, find_or_create_symbol,
+;   the mnemonic dispatch chain) can keep their own loop state live in
+;   those registers across a call here without thinking about it.
+; ===========================================================================
+bytes_eq:
+cmp rcx, rdx
+jne bytes_eq_no
+push r8
+push r9
+push r10
+push r11
+mov r8, rsi
+mov r9, rdi
+mov r10, rcx
+bytes_eq_loop:
+cmp r10, 0
+je bytes_eq_yes
+movb r11, [r8+0]
+movb rax, [r9+0]
+cmp r11, rax
+jne bytes_eq_no_pop
+add r8, 1
+add r9, 1
+sub r10, 1
+jmp bytes_eq_loop
+bytes_eq_yes:
+pop r11
+pop r10
+pop r9
+pop r8
+mov rax, 1
+ret
+bytes_eq_no_pop:
+pop r11
+pop r10
+pop r9
+pop r8
+mov rax, 0
+ret
+bytes_eq_no:
+mov rax, 0
+ret
+
+; ===========================================================================
+; swar_pack -- in: rdi = ptr, rcx = length (0..8) -- out: rax = the 8-byte
+; over-read at [rdi] masked down to the low `length` bytes, little-endian.
+; The over-read is safe: candidate words are always scanned from inbuf,
+; which is mmap'd with slack past the real input (same reasoning as
+; bytes_eq's byte loop, just one load instead of many). Masking by the
+; CANDIDATE's own length (not a fixed width) means a single `cmp` against
+; a mnemonic's packed constant checks content and length at once -- a
+; length-3 candidate can never equal PACK_MOVB, which has a nonzero 4th
+; byte, because masking to 3 bytes zeroes exactly that byte in candidates
+; too.
+; ===========================================================================
+swar_pack:
+mov rax, [rdi+0]
+mov rdx, 1
+mov r8, 0
+swar_pack_maskloop:
+cmp r8, rcx
+je swar_pack_maskdone
+shl rdx, 8
+add r8, 1
+jmp swar_pack_maskloop
+swar_pack_maskdone:
+sub rdx, 1
+and rax, rdx
+ret
+
+; ===========================================================================
+; parse_reg -- match a register name at r13 against reg_table
+;   out: rax = register number 0..15, or NEG_ONE if no match (r13 left
+;   unchanged on failure, same contract as seed's version)
+;   clob: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11
+; ===========================================================================
+parse_reg:
+mov r10, reg_table
+mov r11, 16
+parse_reg_try:
+movb rcx, [r10+0]
+mov rsi, r13
+mov rdi, r10
+add rdi, 3
+mov rdx, rcx
+call bytes_eq
+cmp rax, 1
+jne parse_reg_next
+movb rdx, [r10+0]
+mov rax, r13
+add rax, rdx
+cmp rax, r12
+jae parse_reg_accept
+movb rax, [rax+0]
+mov rdx, class_tbl
+add rdx, rax
+movb rdx, [rdx+0]
+and rdx, CLS_ICONT
+cmp rdx, 0
+je parse_reg_accept
+jmp parse_reg_next
+parse_reg_accept:
+movb rax, [r10+0]
+add r13, rax
+movb rax, [r10+1]
+ret
+parse_reg_next:
+add r10, REG_ENT_LEN
+sub r11, 1
+cmp r11, 0
+jne parse_reg_try
+mov rax, NEG_ONE
+ret
+
+; ===========================================================================
+; parse_imm -- decimal or 0x-hex unsigned value at r13
+;   out: rax = value; r13 advanced past the digits
+;   clob: rax, rcx, rdx
+; ===========================================================================
+parse_imm:
+push r8                         ; r8 = decimal overflow threshold, live for
+mov r8, 1844674407370955162     ; the whole call; restored at parse_imm_done
+                                ; so this routine now PRESERVES r8 rather
+                                ; than clobbering it (strictly safer for
+                                ; every existing caller)
+mov rax, 0
+cmp r13, r12
+jae die_bad_operand
+movb rcx, [r13+0]
+cmp rcx, CH_0
+jne parse_imm_decimal
+mov rdx, r13
+add rdx, 1
+cmp rdx, r12
+jae parse_imm_decimal
+movb rcx, [r13+1]
+cmp rcx, CH_x
+jne parse_imm_decimal
+add r13, 2
+parse_imm_hex_loop:
+cmp r13, r12
+jae parse_imm_done
+movb rcx, [r13+0]
+cmp rcx, CH_0
+jl parse_imm_done
+cmp rcx, CH_9PLUS1
+jae parse_imm_hex_alpha
+sub rcx, CH_0
+jmp parse_imm_hex_acc
+parse_imm_hex_alpha:
+cmp rcx, CH_A
+jl parse_imm_done
+cmp rcx, CH_fPLUS1
+jae parse_imm_done
+cmp rcx, CH_ZPLUS1
+jl parse_imm_hex_upper
+cmp rcx, CH_a
+jl parse_imm_done
+sub rcx, CH_a
+add rcx, 10
+jmp parse_imm_hex_acc
+parse_imm_hex_upper:
+sub rcx, CH_A
+add rcx, 10
+parse_imm_hex_acc:
+mov rdx, rax                    ; overflow guard: any of the top 4 bits
+shr rdx, 60                     ; set means the shl below would shift a
+cmp rdx, 0                      ; significant digit off the end
+jne die_imm_range
+shl rax, 4
+add rax, rcx
+add r13, 1
+jmp parse_imm_hex_loop
+parse_imm_decimal:
+mov rax, 0
+parse_imm_dec_loop:
+cmp r13, r12
+jae parse_imm_done
+movb rcx, [r13+0]
+cmp rcx, CH_0
+jl parse_imm_done
+cmp rcx, CH_9PLUS1
+jae parse_imm_done
+sub rcx, CH_0
+cmp rax, r8                     ; r8 = floor((2^64-1)/10)+1, loaded once
+jae die_imm_range               ; at entry: *10 below would wrap
+mov rdx, rax
+shl rax, 1
+shl rdx, 3
+add rax, rdx                    ; rax = 10 * previous
+mov rdx, rax                    ; keep it to detect wrap on the digit add
+add rax, rcx
+cmp rax, rdx                    ; a wrapped add lands BELOW its input, and
+jae parse_imm_dec_noflow        ; adding 0..9 can never legitimately do
+jmp die_imm_range               ; that
+parse_imm_dec_noflow:
+add r13, 1
+jmp parse_imm_dec_loop
+parse_imm_done:
+pop r8
+ret
+
+; ===========================================================================
+; check_imm32 / check_disp32 -- in: rax = value. Dies unless it fits in a
+; signed 32-bit field. Logically-shifting right by 31 leaves all-zeros for
+; a value in 0..0x7FFFFFFF and exactly 0x1FFFFFFFF for one in
+; -0x80000000..-1; any other pattern means the imm32/disp32 field this
+; value is headed for would silently drop significant bits. Two entry
+; points purely so the error message names the right field.
+;   preserves rax; clob rcx
+; ===========================================================================
+check_imm32:
+push rax
+shr rax, 31
+cmp rax, 0
+je check_imm32_ok
+mov rcx, 0x1FFFFFFFF
+cmp rax, rcx
+jne die_imm_range
+check_imm32_ok:
+pop rax
+ret
+
+check_disp32:
+push rax
+shr rax, 31
+cmp rax, 0
+je check_disp32_ok
+mov rcx, 0x1FFFFFFFF
+cmp rax, rcx
+jne die_disp_range
+check_disp32_ok:
+pop rax
+ret
+
+; ===========================================================================
+; parse_signed_imm -- optional leading '-', then parse_imm's magnitude.
+;   out: rax = value (two's complement negated if '-' was present); r13
+;   advanced. Unlike parse_mem's inline sign handling (which only ever
+;   needed this for displacements), this is the general "imm operand can
+;   be negative" entry point: do_mov's numeric branch and each arithmetic
+;   handler's imm branch use it instead of calling parse_imm directly.
+; ===========================================================================
+parse_signed_imm:
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_MINUS
+jne parse_signed_imm_pos
+add r13, 1
+call parse_imm
+mov rdx, 0
+sub rdx, rax
+mov rax, rdx
+ret
+parse_signed_imm_pos:
+call parse_imm
+ret
+
+; ===========================================================================
+; find_or_create_symbol -- in: rsi/rcx = name ptr/len (points into inbuf,
+; which stays mapped the whole run, so no string copy needed)
+;   out: rax = symbol index, existing or freshly appended (value=0,status=0)
+;   clob: rax, rcx, rdx, rdi, r8, r9 (rsi preserved -- bytes_eq only reads it)
+; symtab entry (32B): {name_ptr:8, name_len:8, value:8, status:8}
+; status: 0=undefined(placeholder) 1=LABEL 2=CONST
+; ===========================================================================
+; ===========================================================================
+; fnv1a -- in: rsi = ptr, rcx = len -> out: rax = 64-bit FNV-1a hash.
+; The multiply-by-prime step is why imul got added to this dialect in the
+; first place -- there's no way to write a hash function without one.
+;   clob: rax, r8, r9, r10, r11
+; ===========================================================================
+fnv1a:
+mov rax, FNV_OFFSET
+mov r8, rsi
+mov r9, 0
+fnv1a_loop:
+cmp r9, rcx
+je fnv1a_done
+movb r10, [r8+0]
+xor rax, r10
+mov r11, FNV_PRIME
+imul rax, r11
+add r8, 1
+add r9, 1
+jmp fnv1a_loop
+fnv1a_done:
+ret
+
+; ===========================================================================
+; find_or_create_symbol -- in: rsi/rcx = name ptr/len (points into inbuf,
+; which stays mapped the whole run, so no string copy needed).
+;   out: rax = SLOT ADDRESS (not an index -- open addressing means a
+;   symbol's slot can be anywhere, so every caller that used to store/pass
+;   a small index now stores/passes this pointer instead; define_label,
+;   define_const, add_fixup and resolve_fixups all changed for it, but
+;   parse_stmt/do_mov/the arithmetic handlers didn't need to, since they
+;   only ever pass this value through opaquely).
+;   Open addressing, linear probing, power-of-2 capacity (SYM_CAP_MASK),
+;   hash stored in the slot so a probe can reject a mismatch without
+;   touching the string table -- this is what turned symbol lookup from
+;   O(n) per call (a real bottleneck: 55x slower on a 100k-line file with
+;   10,000 labels, measured) into O(1) average.
+; symtab slot (64B): {hash:8, name_ptr:8, name_len:8, value:8, status:8}
+; ===========================================================================
+find_or_create_symbol:
+push rsi
+push rcx
+call fnv1a
+pop rcx
+pop rsi
+mov r8, rax                         ; r8 = hash
+mov r9, rax
+and r9, SYM_CAP_MASK                ; r9 = probe index
+focs_probe:
+mov r10, r9
+shl r10, 6                          ; *64 (SYM_ENT)
+mov r11, rbx
+add r11, SYMTAB_OFF
+add r10, r11                        ; r10 = slot address
+mov rax, [r10+32]                   ; status
+cmp rax, 0
+je focs_create
+mov rax, [r10+0]                    ; stored hash
+cmp rax, r8
+jne focs_next
+mov rax, [r10+16]                   ; stored name_len
+cmp rax, rcx
+jne focs_next
+mov rdi, [r10+8]                    ; stored name_ptr
+mov rdx, rcx
+call bytes_eq                       ; rsi/rcx (candidate) survive this
+cmp rax, 1
+jne focs_next
+mov rax, r10
+ret
+focs_next:
+add r9, 1
+and r9, SYM_CAP_MASK
+jmp focs_probe
+focs_create:
+mov r11, rbx
+add r11, SYMTAB_META_OFF        ; repurposed as a population counter --
+mov rax, [r11+0]                ; the hash table has no "count of live
+cmp rax, SYM_POP_MAX            ; entries scanned so far" to track otherwise
+jae die_toomany_syms
+add rax, 1
+mov [r11+0], rax
+mov [r10+0], r8
+mov [r10+8], rsi
+mov [r10+16], rcx
+mov rax, 0
+mov [r10+24], rax
+mov [r10+32], rax
+mov rax, r10
+ret
+
+; ===========================================================================
+; define_label -- in: rax = symbol slot address. Sets value = current
+; output offset, status = 1 (LABEL). Errors if status is already nonzero.
+; ===========================================================================
+; ===========================================================================
+; section_base -- out: rax = current section's buffer base address, rdx =
+; current section id (SEC_TEXT/SEC_DATA). Shared by define_label,
+; add_fixup, and the two label-address-fixup call sites, all of which
+; need "where does an offset in the CURRENT section actually live".
+;   clob: rax, rcx, rdx
+; ===========================================================================
+section_base:
+mov rax, rbx
+add rax, CUR_SECTION_OFF
+mov rdx, [rax+0]
+cmp rdx, SEC_TEXT
+je section_base_text
+mov rax, rbx
+add rax, DATABUF_OFF
+ret
+section_base_text:
+mov rax, r14
+ret
+
+define_label:
+mov r9, rax
+mov rax, [r9+32]
+cmp rax, 0
+jne die_dup_label
+push r9
+call section_base                   ; rax=base, rdx=section id
+mov rcx, r15
+sub rcx, rax
+pop r9
+mov [r9+24], rcx                    ; value (offset within its section)
+mov [r9+40], rdx                    ; section
+mov rdx, 1
+mov [r9+32], rdx                    ; status
+ret
+
+; ===========================================================================
+; define_const -- in: rax = symbol slot address, rdx = value. Sets
+; status = 2 (CONST). Errors if status is already nonzero.
+; ===========================================================================
+define_const:
+mov r9, rax
+mov rax, [r9+32]
+cmp rax, 0
+jne die_dup_label
+mov [r9+24], rdx
+mov rdx, 2
+mov [r9+32], rdx
+ret
+
+; ===========================================================================
+; try_resolve_const -- in: rsi/rcx = name ptr/len. Looks up WITHOUT
+; creating a new entry: only status=2 (CONST) counts as found; an empty
+; slot ends the probe (same open-addressing scheme as
+; find_or_create_symbol, see its comment).
+;   out: rdx = 1 and rax = value if found; rdx = 0 if not. A found value
+;   can legitimately be ANY 64-bit pattern (NEG_ONE's is all-ones), so
+;   found/not-found has to be a separate flag, not a value the caller
+;   compares rax against -- this dialect has no carry flag / stc-clc/jc
+;   the way seed.asm (hand-assembled by nasm) could use for the same fix.
+; ===========================================================================
+try_resolve_const:
+push rsi
+push rcx
+call fnv1a
+pop rcx
+pop rsi
+mov r8, rax
+mov r9, rax
+and r9, SYM_CAP_MASK
+trc_probe:
+mov r10, r9
+shl r10, 6
+mov r11, rbx
+add r11, SYMTAB_OFF
+add r10, r11
+mov rax, [r10+32]
+cmp rax, 0
+je trc_notfound
+mov rax, [r10+0]
+cmp rax, r8
+jne trc_next
+mov rax, [r10+16]
+cmp rax, rcx
+jne trc_next
+mov rdi, [r10+8]
+mov rdx, rcx
+call bytes_eq
+cmp rax, 1
+jne trc_next
+mov rax, [r10+32]
+cmp rax, 2
+jne trc_notfound
+mov rax, [r10+24]
+mov rdx, 1
+ret
+trc_next:
+add r9, 1
+and r9, SYM_CAP_MASK
+jmp trc_probe
+trc_notfound:
+mov rax, 0
+mov rdx, 0
+ret
+
+; ===========================================================================
+; store_dword -- in: rdi = dest address, rax = value. Writes the low 32
+; bits of rax as 4 little-endian bytes at [rdi]. v0.2's mov is always an
+; 8-byte store, so this is how a rel32/imm32 field gets written without
+; clobbering the 4 bytes right after it. r8/r9 saved/restored internally
+; so it's safe to call from inside a loop that keeps state there.
+; ===========================================================================
+store_dword:
+push r8
+push r9
+mov r8, rax
+movb [rdi+0], r8
+mov r9, r8
+shr r9, 8
+movb [rdi+1], r9
+mov r9, r8
+shr r9, 16
+movb [rdi+2], r9
+mov r9, r8
+shr r9, 24
+movb [rdi+3], r9
+pop r9
+pop r8
+ret
+
+; ===========================================================================
+; add_fixup -- in: rdx = patch_off (offset from outbuf base of the field to
+; patch), rax = symbol index, rcx = kind (FIX_REL32 / FIX_ABS64)
+; ===========================================================================
+; in: rdx=patch_off, rax=sym slot address, rcx=kind, r11=section the
+; patch itself lives in (SEC_TEXT/SEC_DATA -- separate from whatever
+; section the referenced SYMBOL is in, which resolve_fixups reads back
+; out of the symbol slot at resolve time)
+add_fixup:
+mov r8, rbx
+add r8, FIXUPS_META_OFF
+mov r8, [r8+0]
+cmp r8, FIX_CAP
+jae die_toomany_fixups
+mov r9, r8
+shl r9, 5
+mov r10, rbx
+add r10, FIXUPS_OFF
+add r9, r10
+mov [r9+0], rdx
+mov [r9+8], rax
+mov [r9+16], rcx
+mov [r9+24], r11
+add r8, 1
+mov r10, rbx
+add r10, FIXUPS_META_OFF
+mov [r10+0], r8
+ret
+
+; ===========================================================================
+; emit_rel32_ref -- parses a label-name operand at r13. Caller has already
+; emitted the opcode byte(s) at r15; this writes the 4-byte placeholder and
+; records a FIX_REL32 fixup patched in after the full scan.
+; ===========================================================================
+emit_rel32_ref:
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+call find_or_create_symbol
+mov r10, rax                        ; sym slot address
+mov rdi, r15
+mov rax, 0
+call store_dword
+call section_base                   ; rax=base, rdx=section id
+mov r11, rdx                        ; add_fixup's section param
+mov rdx, r15
+sub rdx, rax                        ; patch_off relative to that base
+mov rax, r10
+mov rcx, FIX_REL32
+call add_fixup
+add r15, 4
+ret
+
+; ===========================================================================
+; resolve_fixups -- one linear walk; patch every recorded fixup.
+;   FIX_REL32: rel32 = target - (patch_off + 4), written via store_dword.
+;   FIX_ABS64: qword = target + LOAD_BASE (the bias does NOT cancel here,
+;   unlike rel32 -- an absolute pointer needs it added back explicitly).
+; ===========================================================================
+; --- pre-loop: finalize both section cursors, compute text/data sizes and
+; where .data actually lands in the output file. Single-pass means this is
+; the earliest point that's knowable -- a fixup or label defined mid-scan
+; can't yet know where .data will start if it hasn't been scanned yet.
+resolve_fixups:
+mov rax, rbx
+add rax, CUR_SECTION_OFF
+mov rcx, [rax+0]
+cmp rcx, SEC_TEXT
+je rf_save_text
+mov rax, rbx
+add rax, SAVED_DATA_R15_OFF
+mov [rax+0], r15
+jmp rf_sizes
+rf_save_text:
+mov rax, rbx
+add rax, SAVED_TEXT_R15_OFF
+mov [rax+0], r15
+rf_sizes:
+mov rax, rbx
+add rax, SAVED_TEXT_R15_OFF
+mov rax, [rax+0]
+sub rax, r14                        ; header + text size
+add rax, 4095
+mov rcx, PAGE_MASK
+and rax, rcx                        ; round up to a page -- text and data
+                                     ; must not share a page, since they
+                                     ; get different PT_LOAD permissions
+mov rcx, rbx
+add rcx, DATA_FILE_START_OFF
+mov [rcx+0], rax
+
+; --- per-fixup resolution. Every value below stays in a fixed register
+; for the whole iteration (verified against every intervening write, not
+; just declared) rather than round-tripping through the stack: rax=
+; patch_off (relative to the fixup's own section, unchanged all the way
+; to the final write-address add), rcx=kind, rdx=fixup's own section
+; (read twice: once for the patch-offset adjustment, once for the write
+; buffer choice -- both from the same untouched load), rsi/rdi=scratch,
+; r11=symbol value -> becomes the absolute target, r10=fixup record
+; pointer until its fields are extracted, then reused as the write
+; buffer's base.
+mov r8, rbx
+add r8, FIXUPS_META_OFF
+mov r8, [r8+0]
+mov r9, 0
+rf_loop:
+cmp r9, r8
+jae rf_done
+mov r10, r9
+shl r10, 5
+mov rdi, rbx
+add rdi, FIXUPS_OFF
+add r10, rdi
+
+mov rax, [r10+0]                    ; patch_off
+mov rcx, [r10+16]                   ; kind
+mov rdx, [r10+24]                   ; fixup's own section
+mov rsi, [r10+8]                    ; symbol slot address (temp)
+
+mov rdi, [rsi+32]                   ; symbol status
+cmp rdi, 0
+je die_undef_label
+mov r11, [rsi+24]                   ; symbol value (relative) -> target
+mov rsi, [rsi+40]                   ; symbol's own section
+
+cmp rsi, SEC_TEXT
+je rf_target_text
+mov rdi, rbx
+add rdi, DATA_FILE_START_OFF
+mov rdi, [rdi+0]
+add r11, rdi                        ; r11 = absolute target file offset
+rf_target_text:
+
+mov rsi, rax                        ; rsi = patch_off copy
+cmp rdx, SEC_TEXT
+je rf_patch_text
+mov rdi, rbx
+add rdi, DATA_FILE_START_OFF
+mov rdi, [rdi+0]
+add rsi, rdi                        ; rsi = absolute patch file offset
+rf_patch_text:
+
+cmp rcx, FIX_ABS64
+je rf_abs64
+
+; --- FIX_REL32: rel32 = target_abs - (patch_abs + 4) ---
+mov rdi, r11
+sub rdi, rsi
+sub rdi, 4
+cmp rdx, SEC_TEXT
+je rf_rel_write_text
+mov r10, rbx
+add r10, DATABUF_OFF
+jmp rf_rel_write_haveaddr
+rf_rel_write_text:
+mov r10, r14
+rf_rel_write_haveaddr:
+add r10, rax                        ; r10 = write address (base+patch_off)
+mov rax, rdi                        ; store_dword: rax=value
+mov rdi, r10                        ; store_dword: rdi=dest
+call store_dword
+jmp rf_next
+
+rf_abs64:
+; A forward-referenced name that turned out to be an `equ` constant, not
+; a label, holds a plain value -- adding the load bias to it would be
+; silently wrong (it produced 0x400005 for `mov rax, LATER` / `LATER equ
+; 5` before this check existed). Only real label addresses get biased.
+mov rdi, [r10+8]                    ; symbol slot address (r10 is still
+mov rdi, [rdi+32]                   ; the fixup record here, not yet
+cmp rdi, 2                          ; reused as the write base below)
+je rf_abs_nobias
+add r11, LOAD_BASE                  ; r11 = absolute runtime address
+rf_abs_nobias:
+cmp rdx, SEC_TEXT
+je rf_abs_write_text
+mov r10, rbx
+add r10, DATABUF_OFF
+jmp rf_abs_write_haveaddr
+rf_abs_write_text:
+mov r10, r14
+rf_abs_write_haveaddr:
+add r10, rax                        ; r10 = write address (base+patch_off)
+mov [r10+0], r11
+rf_next:
+add r9, 1
+jmp rf_loop
+rf_done:
+ret
+
+; ===========================================================================
+; emit_rr -- REX.W(+R+B) + opcode + ModRM(mod=11, reg=src, rm=dst)
+;   in: r10 = opcode byte, rax = dst reg, rdx = src reg -> r15 += 3
+;   Each REX/ModRM bit-field add below combines strictly disjoint bits
+;   (same reasoning as seed's emit_rr, just spelled `add` since this
+;   dialect has add/sub/cmp reg-imm but movb/mov only for memory -- no
+;   memory-operand `or`), so add and or are interchangeable here.
+; ===========================================================================
+emit_rr:
+mov rcx, 0x48
+mov rsi, rdx
+shr rsi, 3
+shl rsi, 2
+add rcx, rsi
+mov rsi, rax
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+
+movb [r15+1], r10
+
+mov rsi, rdx
+and rsi, 7
+shl rsi, 3
+mov rdi, rax
+and rdi, 7
+add rsi, rdi
+add rsi, 0xC0
+movb [r15+2], rsi
+
+add r15, 3
+ret
+
+; ===========================================================================
+; emit_neg -- REX.W(+B) + F7 /3 + ModRM (NEG r/m64, single operand; /3 is
+; an opcode extension packed into the same fixed-digit ModRM shape as
+; emit_grp1_imm, just with no immediate following)
+;   in: rax = reg -> r15 += 3
+; ===========================================================================
+emit_neg:
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rcx, 0xF7
+movb [r15+1], rcx
+mov rsi, rax
+and rsi, 7
+add rsi, 0xD8                       ; mod=11(0xC0) | digit=3(0x18)
+movb [r15+2], rsi
+add r15, 3
+ret
+
+; ===========================================================================
+; emit_mem -- REX.W(+R+B) + opcode + ModRM(mod=10)[+SIB] + disp32
+;   in: r10 = opcode, rax = reg field, rdx = base reg, r9 = signed disp
+;   out: r15 += 7 (no SIB) or 8 (base is rsp/r12)
+; ===========================================================================
+emit_mem:
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+shl rsi, 2
+add rcx, rsi
+mov rsi, rdx
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+
+movb [r15+1], r10
+
+mov rsi, rax
+and rsi, 7
+shl rsi, 3
+add rsi, 0x80
+mov rdi, rdx
+and rdi, 7
+cmp rdi, 4
+je emit_mem_sib
+add rsi, rdi
+movb [r15+2], rsi
+mov rdi, r15
+add rdi, 3
+mov rax, r9
+call store_dword
+add r15, 7
+ret
+emit_mem_sib:
+add rsi, 4
+movb [r15+2], rsi
+mov rax, 0x24
+movb [r15+3], rax
+mov rdi, r15
+add rdi, 4
+mov rax, r9
+call store_dword
+add r15, 8
+ret
+
+; ===========================================================================
+; emit_movb_load -- REX.W(+R+B) + 0F B6 /r + ModRM[+SIB] + disp32
+; (MOVZX r64, r/m8)
+;   in: rax = dst reg, rdx = base reg, r9 = signed disp
+;   out: r15 += 8 (no SIB) or 9 (base is rsp/r12)
+; ===========================================================================
+emit_movb_load:
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+shl rsi, 2
+add rcx, rsi
+mov rsi, rdx
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rcx, 15
+movb [r15+1], rcx
+mov rcx, 0xB6
+movb [r15+2], rcx
+
+mov rsi, rax
+and rsi, 7
+shl rsi, 3
+add rsi, 0x80
+mov rdi, rdx
+and rdi, 7
+cmp rdi, 4
+je emit_movb_load_sib
+add rsi, rdi
+movb [r15+3], rsi
+mov rdi, r15
+add rdi, 4
+mov rax, r9
+call store_dword
+add r15, 8
+ret
+emit_movb_load_sib:
+add rsi, 4
+movb [r15+3], rsi
+mov rax, 0x24
+movb [r15+4], rax
+mov rdi, r15
+add rdi, 5
+mov rax, r9
+call store_dword
+add r15, 9
+ret
+
+; ===========================================================================
+; emit_movb_store -- REX(always present) + 88 /r + ModRM[+SIB] + disp32
+; (MOV r/m8, r8 -- REX forced even when otherwise unneeded, so reg=4..7
+; means SPL/BPL/SIL/DIL and never AH/CH/DH/BH)
+;   in: rax = src reg, rdx = base reg, r9 = signed disp
+;   out: r15 += 7 (no SIB) or 8 (base is rsp/r12)
+; ===========================================================================
+emit_movb_store:
+mov rcx, 0x40
+mov rsi, rax
+shr rsi, 3
+shl rsi, 2
+add rcx, rsi
+mov rsi, rdx
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rcx, 0x88
+movb [r15+1], rcx
+
+mov rsi, rax
+and rsi, 7
+shl rsi, 3
+add rsi, 0x80
+mov rdi, rdx
+and rdi, 7
+cmp rdi, 4
+je emit_movb_store_sib
+add rsi, rdi
+movb [r15+2], rsi
+mov rdi, r15
+add rdi, 3
+mov rax, r9
+call store_dword
+add r15, 7
+ret
+emit_movb_store_sib:
+add rsi, 4
+movb [r15+2], rsi
+mov rax, 0x24
+movb [r15+3], rax
+mov rdi, r15
+add rdi, 4
+mov rax, r9
+call store_dword
+add r15, 8
+ret
+
+; ===========================================================================
+; emit_movw_load -- REX.W(+R+B) + 0F B7 /r + ModRM[+SIB] + disp32
+; (MOVZX r64, r/m16 -- same shape as emit_movb_load, opcode 0xB7 not
+; 0xB6). REX.W is mandatory here regardless of register choice, same
+; reasoning as movb: the destination is always the full 64-bit register.
+;   in: rax = dst reg, rdx = base reg, r9 = signed disp
+;   out: r15 += 8 (no SIB) or 9 (base is rsp/r12)
+; ===========================================================================
+emit_movw_load:
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+shl rsi, 2
+add rcx, rsi
+mov rsi, rdx
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rcx, 15
+movb [r15+1], rcx
+mov rcx, 0xB7
+movb [r15+2], rcx
+
+mov rsi, rax
+and rsi, 7
+shl rsi, 3
+add rsi, 0x80
+mov rdi, rdx
+and rdi, 7
+cmp rdi, 4
+je emit_movw_load_sib
+add rsi, rdi
+movb [r15+3], rsi
+mov rdi, r15
+add rdi, 4
+mov rax, r9
+call store_dword
+add r15, 8
+ret
+emit_movw_load_sib:
+add rsi, 4
+movb [r15+3], rsi
+mov rax, 0x24
+movb [r15+4], rax
+mov rdi, r15
+add rdi, 5
+mov rax, r9
+call store_dword
+add r15, 9
+ret
+
+; ===========================================================================
+; emit_movw_store -- 66 + REX(always present) + 89 /r + ModRM[+SIB] +
+; disp32 (MOV r/m16, r16). The 0x66 operand-size override must precede
+; REX in the byte stream. REX isn't strictly required for 16-bit regs
+; (no AH/CH/DH/BH-style ambiguity the way movb's store has), but it's
+; forced anyway for the same fixed-byte-layout simplicity as movb/movd.
+;   in: rax = src reg, rdx = base reg, r9 = signed disp
+;   out: r15 += 8 (no SIB) or 9 (base is rsp/r12)
+; ===========================================================================
+emit_movw_store:
+mov rcx, 0x66
+movb [r15+0], rcx
+mov rcx, 0x40
+mov rsi, rax
+shr rsi, 3
+shl rsi, 2
+add rcx, rsi
+mov rsi, rdx
+shr rsi, 3
+add rcx, rsi
+movb [r15+1], rcx
+mov rcx, 0x89
+movb [r15+2], rcx
+
+mov rsi, rax
+and rsi, 7
+shl rsi, 3
+add rsi, 0x80
+mov rdi, rdx
+and rdi, 7
+cmp rdi, 4
+je emit_movw_store_sib
+add rsi, rdi
+movb [r15+3], rsi
+mov rdi, r15
+add rdi, 4
+mov rax, r9
+call store_dword
+add r15, 8
+ret
+emit_movw_store_sib:
+add rsi, 4
+movb [r15+3], rsi
+mov rax, 0x24
+movb [r15+4], rax
+mov rdi, r15
+add rdi, 5
+mov rax, r9
+call store_dword
+add r15, 9
+ret
+
+; ===========================================================================
+; emit_movd_load -- REX(always present, W=0)+8B /r+ModRM[+SIB]+disp32
+; (MOV r32, r/m32 -- a plain 32-bit load, no MOVZX opcode needed: x86-64
+; automatically zero-extends any 32-bit register write into the full
+; 64-bit register, so this already has movb/movw's "load and zero-
+; extend" behavior for free). REX carries only R/B here, never W.
+;   in: rax = dst reg, rdx = base reg, r9 = signed disp
+;   out: r15 += 7 (no SIB) or 8 (base is rsp/r12)
+; ===========================================================================
+emit_movd_load:
+mov rcx, 0x40
+mov rsi, rax
+shr rsi, 3
+shl rsi, 2
+add rcx, rsi
+mov rsi, rdx
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rcx, 0x8B
+movb [r15+1], rcx
+
+mov rsi, rax
+and rsi, 7
+shl rsi, 3
+add rsi, 0x80
+mov rdi, rdx
+and rdi, 7
+cmp rdi, 4
+je emit_movd_load_sib
+add rsi, rdi
+movb [r15+2], rsi
+mov rdi, r15
+add rdi, 3
+mov rax, r9
+call store_dword
+add r15, 7
+ret
+emit_movd_load_sib:
+add rsi, 4
+movb [r15+2], rsi
+mov rax, 0x24
+movb [r15+3], rax
+mov rdi, r15
+add rdi, 4
+mov rax, r9
+call store_dword
+add r15, 8
+ret
+
+; ===========================================================================
+; emit_movd_store -- REX(always present, W=0)+89 /r+ModRM[+SIB]+disp32
+; (MOV r/m32, r32). Same shape as emit_movd_load, opcode 0x89 not 0x8B.
+;   in: rax = src reg, rdx = base reg, r9 = signed disp
+;   out: r15 += 7 (no SIB) or 8 (base is rsp/r12)
+; ===========================================================================
+emit_movd_store:
+mov rcx, 0x40
+mov rsi, rax
+shr rsi, 3
+shl rsi, 2
+add rcx, rsi
+mov rsi, rdx
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rcx, 0x89
+movb [r15+1], rcx
+
+mov rsi, rax
+and rsi, 7
+shl rsi, 3
+add rsi, 0x80
+mov rdi, rdx
+and rdi, 7
+cmp rdi, 4
+je emit_movd_store_sib
+add rsi, rdi
+movb [r15+2], rsi
+mov rdi, r15
+add rdi, 3
+mov rax, r9
+call store_dword
+add r15, 7
+ret
+emit_movd_store_sib:
+add rsi, 4
+movb [r15+2], rsi
+mov rax, 0x24
+movb [r15+3], rax
+mov rdi, r15
+add rdi, 4
+mov rax, r9
+call store_dword
+add r15, 8
+ret
+
+; ===========================================================================
+; emit_grp1_imm -- REX.W(+B) + 81 /digit + ModRM + imm32
+;   in: r10 = /digit (0,1,4,5,6,7), rax = dst reg, r9 = imm32 value
+;   out: r15 += 7
+; ===========================================================================
+emit_grp1_imm:
+push rax                         ; the 81 /digit form carries only imm32
+mov rax, r9                      ; (sign-extended at run time), so anything
+call check_imm32                 ; wider than signed 32 bits cannot be
+pop rax                          ; encoded here and must not be truncated
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rsi, 0x81
+movb [r15+1], rsi
+
+mov rsi, rax
+and rsi, 7
+mov rdi, r10
+shl rdi, 3
+add rsi, rdi
+add rsi, 0xC0
+movb [r15+2], rsi
+
+mov rdi, r15
+add rdi, 3
+mov rax, r9
+call store_dword
+add r15, 7
+ret
+
+; ===========================================================================
+; emit_shift_imm -- REX.W(+B) + C1 /digit + ModRM + imm8
+;   in: r10 = /digit (4 or 5), rax = dst reg, r11 = imm8 count
+;   out: r15 += 4
+; ===========================================================================
+emit_shift_imm:
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rsi, 0xC1
+movb [r15+1], rsi
+
+mov rsi, rax
+and rsi, 7
+mov rdi, r10
+shl rdi, 3
+add rsi, rdi
+add rsi, 0xC0
+movb [r15+2], rsi
+movb [r15+3], r11
+
+add r15, 4
+ret
+
+; ===========================================================================
+; parse_mem -- parses "[reg+imm]" or "[reg-imm]" at r13 (must start '[')
+;   out: rax = base register, r9 = signed disp; r13 advanced past ']'
+; ===========================================================================
+parse_mem:
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_LBRACKET
+jne die_bad_operand
+add r13, 1
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+cmp r13, r12
+jae die_bad_operand
+movb rcx, [r13+0]
+cmp rcx, CH_PLUS
+je parse_mem_pos
+cmp rcx, CH_MINUS
+je parse_mem_neg
+jmp die_bad_operand
+parse_mem_pos:
+add r13, 1
+call parse_imm
+jmp parse_mem_haveimm
+parse_mem_neg:
+add r13, 1
+call parse_imm
+mov rdx, 0
+sub rdx, rax
+mov rax, rdx
+parse_mem_haveimm:
+call check_disp32                ; the ModRM forms this dialect emits all
+                                 ; use mod=10 (disp32); a wider value would
+                                 ; be silently truncated into that field
+mov r9, rax
+pop rax
+cmp r13, r12
+jae die_bad_operand
+movb rcx, [r13+0]
+cmp rcx, CH_RBRACKET
+jne die_bad_operand
+add r13, 1
+ret
+
+; ===========================================================================
+; do_mov -- reg,imm64 / reg,reg / reg,[mem] / [mem],reg / reg,label-or-const
+; ===========================================================================
+do_mov:
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_LBRACKET
+je do_mov_store
+
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax                          ; dst reg -- parse_reg/parse_imm/parse_mem
+                                  ; all clobber r10/r11, so this has to live
+                                  ; on the stack across them
+
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_LBRACKET
+je do_mov_load
+
+cmp rax, CH_MINUS
+je do_mov_imm_numeric
+cmp rax, CH_0
+jl do_mov_try_reg_or_label
+cmp rax, CH_9PLUS1
+jae do_mov_try_reg_or_label
+jmp do_mov_imm_numeric
+
+do_mov_try_reg_or_label:
+call parse_reg                    ; r13 unchanged on failure -> scan_ident
+cmp rax, NEG_ONE                  ; can pick up cleanly right after
+jne do_mov_regreg_have_src
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+call try_resolve_const
+cmp rdx, 0
+jne do_mov_const_have_value
+
+call find_or_create_symbol        ; not a constant -- forward-capable label
+mov r11, rax                      ; sym slot address
+pop rax
+mov r10, rax
+mov rax, 0x48
+mov rcx, r10
+shr rcx, 3
+add rax, rcx
+movb [r15+0], rax
+mov rcx, r10
+and rcx, 7
+add rcx, 0xB8
+movb [r15+1], rcx
+mov rcx, 0
+mov [r15+2], rcx                  ; zeros the whole 8-byte placeholder
+call section_base                 ; rax=base, rdx=section id
+mov r9, rdx                       ; stash section id (r11 still holds
+                                  ; the sym slot address at this point)
+mov rdx, r15
+add rdx, 2
+sub rdx, rax                      ; patch_off relative to section base
+mov rax, r11
+mov rcx, FIX_ABS64
+mov r11, r9                       ; add_fixup's section param
+call add_fixup
+add r15, 10
+jmp do_mov_tail
+
+do_mov_const_have_value:
+mov r10, rax                      ; constant's value
+pop rax                           ; dst reg
+mov r11, rax
+mov rax, 0x48
+mov rcx, r11
+shr rcx, 3
+add rax, rcx
+movb [r15+0], rax
+mov rcx, r11
+and rcx, 7
+add rcx, 0xB8
+movb [r15+1], rcx
+mov [r15+2], r10
+add r15, 10
+jmp do_mov_tail
+
+do_mov_imm_numeric:
+call parse_signed_imm
+mov r10, rax
+pop rax
+mov r11, rax
+mov rax, 0x48
+mov rcx, r11
+shr rcx, 3
+add rax, rcx
+movb [r15+0], rax
+mov rcx, r11
+and rcx, 7
+add rcx, 0xB8
+movb [r15+1], rcx
+mov [r15+2], r10
+add r15, 10
+jmp do_mov_tail
+
+do_mov_regreg_have_src:
+mov rdx, rax
+pop rax
+mov r10, 0x89
+call emit_rr
+jmp do_mov_tail
+
+do_mov_load:
+call parse_mem
+mov rdx, rax
+pop rax
+mov r10, 0x8B
+call emit_mem
+jmp do_mov_tail
+
+do_mov_store:
+call parse_mem
+mov rdx, rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+push rdx
+push r9
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+pop r9
+pop rdx
+mov r10, 0x89
+call emit_mem
+
+do_mov_tail:
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; add/sub/and/or/xor/cmp reg,reg-or-imm-or-const -- six near-identical
+; blocks (no macro facility in this dialect); only the grp1 /digit and the
+; rr opcode differ per op.
+; ===========================================================================
+do_add:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_MINUS
+je do_add_imm
+cmp rax, CH_0
+jl do_add_reg_or_const
+cmp rax, CH_9PLUS1
+jae do_add_reg_or_const
+do_add_imm:
+call parse_signed_imm
+mov r9, rax
+pop rax
+mov r10, 0
+call emit_grp1_imm
+jmp do_add_tail
+do_add_reg_or_const:
+call parse_reg
+cmp rax, NEG_ONE
+jne do_add_have_src
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+call try_resolve_const
+cmp rdx, 0
+je die_bad_operand
+mov r9, rax
+pop rax
+mov r10, 0
+call emit_grp1_imm
+jmp do_add_tail
+do_add_have_src:
+mov rdx, rax
+pop rax
+mov r10, 0x01
+call emit_rr
+do_add_tail:
+call skip_ws
+call skip_to_eol
+ret
+
+do_sub:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_MINUS
+je do_sub_imm
+cmp rax, CH_0
+jl do_sub_reg_or_const
+cmp rax, CH_9PLUS1
+jae do_sub_reg_or_const
+do_sub_imm:
+call parse_signed_imm
+mov r9, rax
+pop rax
+mov r10, 5
+call emit_grp1_imm
+jmp do_sub_tail
+do_sub_reg_or_const:
+call parse_reg
+cmp rax, NEG_ONE
+jne do_sub_have_src
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+call try_resolve_const
+cmp rdx, 0
+je die_bad_operand
+mov r9, rax
+pop rax
+mov r10, 5
+call emit_grp1_imm
+jmp do_sub_tail
+do_sub_have_src:
+mov rdx, rax
+pop rax
+mov r10, 0x29
+call emit_rr
+do_sub_tail:
+call skip_ws
+call skip_to_eol
+ret
+
+do_and:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_MINUS
+je do_and_imm
+cmp rax, CH_0
+jl do_and_reg_or_const
+cmp rax, CH_9PLUS1
+jae do_and_reg_or_const
+do_and_imm:
+call parse_signed_imm
+mov r9, rax
+pop rax
+mov r10, 4
+call emit_grp1_imm
+jmp do_and_tail
+do_and_reg_or_const:
+call parse_reg
+cmp rax, NEG_ONE
+jne do_and_have_src
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+call try_resolve_const
+cmp rdx, 0
+je die_bad_operand
+mov r9, rax
+pop rax
+mov r10, 4
+call emit_grp1_imm
+jmp do_and_tail
+do_and_have_src:
+mov rdx, rax
+pop rax
+mov r10, 0x21
+call emit_rr
+do_and_tail:
+call skip_ws
+call skip_to_eol
+ret
+
+do_or:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_MINUS
+je do_or_imm
+cmp rax, CH_0
+jl do_or_reg_or_const
+cmp rax, CH_9PLUS1
+jae do_or_reg_or_const
+do_or_imm:
+call parse_signed_imm
+mov r9, rax
+pop rax
+mov r10, 1
+call emit_grp1_imm
+jmp do_or_tail
+do_or_reg_or_const:
+call parse_reg
+cmp rax, NEG_ONE
+jne do_or_have_src
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+call try_resolve_const
+cmp rdx, 0
+je die_bad_operand
+mov r9, rax
+pop rax
+mov r10, 1
+call emit_grp1_imm
+jmp do_or_tail
+do_or_have_src:
+mov rdx, rax
+pop rax
+mov r10, 0x09
+call emit_rr
+do_or_tail:
+call skip_ws
+call skip_to_eol
+ret
+
+do_xor:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_MINUS
+je do_xor_imm
+cmp rax, CH_0
+jl do_xor_reg_or_const
+cmp rax, CH_9PLUS1
+jae do_xor_reg_or_const
+do_xor_imm:
+call parse_signed_imm
+mov r9, rax
+pop rax
+mov r10, 6
+call emit_grp1_imm
+jmp do_xor_tail
+do_xor_reg_or_const:
+call parse_reg
+cmp rax, NEG_ONE
+jne do_xor_have_src
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+call try_resolve_const
+cmp rdx, 0
+je die_bad_operand
+mov r9, rax
+pop rax
+mov r10, 6
+call emit_grp1_imm
+jmp do_xor_tail
+do_xor_have_src:
+mov rdx, rax
+pop rax
+mov r10, 0x31
+call emit_rr
+do_xor_tail:
+call skip_ws
+call skip_to_eol
+ret
+
+do_cmp:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_MINUS
+je do_cmp_imm
+cmp rax, CH_0
+jl do_cmp_reg_or_const
+cmp rax, CH_9PLUS1
+jae do_cmp_reg_or_const
+do_cmp_imm:
+call parse_signed_imm
+mov r9, rax
+pop rax
+mov r10, 7
+call emit_grp1_imm
+jmp do_cmp_tail
+do_cmp_reg_or_const:
+call parse_reg
+cmp rax, NEG_ONE
+jne do_cmp_have_src
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+call try_resolve_const
+cmp rdx, 0
+je die_bad_operand
+mov r9, rax
+pop rax
+mov r10, 7
+call emit_grp1_imm
+jmp do_cmp_tail
+do_cmp_have_src:
+mov rdx, rax
+pop rax
+mov r10, 0x39
+call emit_rr
+do_cmp_tail:
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; resolve_imm_operand -- numeric literal or defined const at r13
+;   out: rax = value; r13 advanced. Used by shift counts and db byte values.
+; ===========================================================================
+resolve_imm_operand:
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_0
+jl resolve_imm_operand_const
+cmp rax, CH_9PLUS1
+jae resolve_imm_operand_const
+call parse_imm
+ret
+resolve_imm_operand_const:
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+call try_resolve_const
+cmp rdx, 0
+je die_bad_operand
+ret
+
+; ===========================================================================
+; shl/shr reg, imm8-or-const -- variable-count (shift by cl) not implemented
+; ===========================================================================
+do_shl:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+call resolve_imm_operand
+mov r11, rax
+pop rax
+mov r10, 4
+call emit_shift_imm
+call skip_ws
+call skip_to_eol
+ret
+
+do_shr:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+call resolve_imm_operand
+mov r11, rax
+pop rax
+mov r10, 5
+call emit_shift_imm
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; lea reg, [reg+N] -- REX.W(+R+B) + 8D /r + ModRM[+SIB] + disp32 (LEA r64,m).
+; Reuses emit_mem entirely -- same addressing-mode encoding as mov's load
+; form, just opcode 0x8D instead of 0x8B, and no memory access happens at
+; runtime (the effective address itself is the result).
+; ===========================================================================
+do_lea:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+call parse_mem
+mov rdx, rax
+pop rax
+mov r10, 0x8D
+call emit_mem
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; imul reg, reg -- REX.W(+R+B) + 0F AF /r (IMUL r64, r/m64). Unlike
+; add/sub/and/or/xor/cmp's "reg=src, rm=dst" (MR) encoding, this opcode's
+; ModRM is "reg=dst, rm=src" (RM) -- SDM Vol2's IMUL r64,r/m64 entry -- so
+; it needs its own emit routine rather than reusing emit_rr.
+; ===========================================================================
+emit_imul:
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+shl rsi, 2
+add rcx, rsi
+mov rsi, rdx
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rsi, 15
+movb [r15+1], rsi
+mov rsi, 0xAF
+movb [r15+2], rsi
+
+mov rsi, rax
+and rsi, 7
+shl rsi, 3
+mov rdi, rdx
+and rdi, 7
+add rsi, rdi
+add rsi, 0xC0
+movb [r15+3], rsi
+
+add r15, 4
+ret
+
+do_imul:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+mov rdx, rax
+pop rax
+call emit_imul
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; test reg, reg -- same encoding shape as add/sub/cmp reg,reg, so this
+; just reuses emit_rr with opcode 0x85. Reg,imm form not implemented
+; (the workaround, cmp reg,0, covers what this dialect's own code needs).
+; ===========================================================================
+do_test:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+mov rdx, rax
+pop rax
+mov r10, 0x85
+call emit_rr
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; neg reg -- single operand
+; ===========================================================================
+do_neg:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+call emit_neg
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; movb reg,[reg+N] / movb [reg+N],reg -- byte load/store
+; ===========================================================================
+do_movb:
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_LBRACKET
+je do_movb_store
+
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+call parse_mem
+mov rdx, rax
+pop rax
+call emit_movb_load
+jmp do_movb_tail
+
+do_movb_store:
+call parse_mem
+mov rdx, rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+push rdx
+push r9
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+pop r9
+pop rdx
+call emit_movb_store
+do_movb_tail:
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; movw reg,[reg+N] / movw [reg+N],reg -- 16-bit load/store, same shape as
+; do_movb with the wider emit_movw_load/store.
+; ===========================================================================
+do_movw:
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_LBRACKET
+je do_movw_store
+
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+call parse_mem
+mov rdx, rax
+pop rax
+call emit_movw_load
+jmp do_movw_tail
+
+do_movw_store:
+call parse_mem
+mov rdx, rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+push rdx
+push r9
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+pop r9
+pop rdx
+call emit_movw_store
+do_movw_tail:
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; movd reg,[reg+N] / movd [reg+N],reg -- 32-bit load/store, same shape as
+; do_movb with the wider emit_movd_load/store.
+; ===========================================================================
+do_movd:
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_LBRACKET
+je do_movd_store
+
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+push rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+call parse_mem
+mov rdx, rax
+pop rax
+call emit_movd_load
+jmp do_movd_tail
+
+do_movd_store:
+call parse_mem
+mov rdx, rax
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_COMMA
+jne die_bad_operand
+add r13, 1
+call skip_ws
+push rdx
+push r9
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+pop r9
+pop rdx
+call emit_movd_store
+do_movd_tail:
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; push/pop reg -- 50+rd/58+rd, REX.B prefix only when reg>=8
+; ===========================================================================
+do_push:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+mov rcx, rax
+cmp rcx, 8
+jl do_push_norex
+mov rax, 0x41
+movb [r15+0], rax
+mov rdx, rcx
+and rdx, 7
+add rdx, 0x50
+movb [r15+1], rdx
+add r15, 2
+jmp do_push_done
+do_push_norex:
+add rcx, 0x50
+movb [r15+0], rcx
+add r15, 1
+do_push_done:
+call skip_ws
+call skip_to_eol
+ret
+
+do_pop:
+call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+je die_bad_operand
+mov rcx, rax
+cmp rcx, 8
+jl do_pop_norex
+mov rax, 0x41
+movb [r15+0], rax
+mov rdx, rcx
+and rdx, 7
+add rdx, 0x58
+movb [r15+1], rdx
+add r15, 2
+jmp do_pop_done
+do_pop_norex:
+add rcx, 0x58
+movb [r15+0], rcx
+add r15, 1
+do_pop_done:
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; jmp/call/je/jne/jl/jae label -- opcode(s) then a rel32 label reference
+; ===========================================================================
+do_jmp:
+call skip_ws
+mov rax, 0xE9
+movb [r15+0], rax
+add r15, 1
+call emit_rel32_ref
+call skip_ws
+call skip_to_eol
+ret
+
+do_call:
+call skip_ws
+mov rax, 0xE8
+movb [r15+0], rax
+add r15, 1
+call emit_rel32_ref
+call skip_ws
+call skip_to_eol
+ret
+
+do_je:
+call skip_ws
+mov rax, 15
+movb [r15+0], rax
+mov rax, 0x84
+movb [r15+1], rax
+add r15, 2
+call emit_rel32_ref
+call skip_ws
+call skip_to_eol
+ret
+
+do_jne:
+call skip_ws
+mov rax, 15
+movb [r15+0], rax
+mov rax, 0x85
+movb [r15+1], rax
+add r15, 2
+call emit_rel32_ref
+call skip_ws
+call skip_to_eol
+ret
+
+do_jl:
+call skip_ws
+mov rax, 15
+movb [r15+0], rax
+mov rax, 0x8C
+movb [r15+1], rax
+add r15, 2
+call emit_rel32_ref
+call skip_ws
+call skip_to_eol
+ret
+
+do_jae:
+call skip_ws
+mov rax, 15
+movb [r15+0], rax
+mov rax, 0x83
+movb [r15+1], rax
+add r15, 2
+call emit_rel32_ref
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; syscall (0F 05) / ret (C3)
+; ===========================================================================
+do_syscall:
+mov rax, 15
+movb [r15+0], rax
+mov rax, 5
+movb [r15+1], rax
+add r15, 2
+call skip_ws
+call skip_to_eol
+ret
+
+do_ret:
+mov rax, 0xC3
+movb [r15+0], rax
+add r15, 1
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; db "literal" (verbatim, no escapes) or db imm8/const (single raw byte)
+; ===========================================================================
+do_db:
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_QUOTE
+je do_db_string
+
+call resolve_imm_operand
+movb [r15+0], rax
+add r15, 1
+jmp do_db_tail
+
+do_db_string:
+add r13, 1
+do_db_copy:
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_QUOTE
+je do_db_close
+movb [r15+0], rax
+add r15, 1
+add r13, 1
+jmp do_db_copy
+do_db_close:
+add r13, 1
+do_db_tail:
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; parse_stmt -- "ident:" defines a label, "ident equ imm" defines a
+; constant, otherwise ident is a mnemonic matched by a compare chain.
+;   r10/r11 stash word1 (name ptr/len) across everything below -- neither
+;   is touched by find_or_create_symbol, scan_ident, parse_imm, or bytes_eq
+;   (verified against each routine's own clobber list), so this is safe
+;   without needing the stack.
+; ===========================================================================
+parse_stmt:
+cmp r13, r12
+jae parse_stmt_ident
+movb rax, [r13+0]
+cmp rax, CH_DOT
+jne parse_stmt_ident
+add r13, 1
+call scan_ident
+cmp rcx, 0
+je die_unknown_mnem
+mov rdi, rsi
+call swar_pack
+cmp rax, PACK_TEXT
+je do_section_text
+cmp rax, PACK_DATA
+je do_section_data
+jmp die_unknown_mnem
+
+parse_stmt_ident:
+call scan_ident
+cmp rcx, 0
+je die_unknown_mnem
+mov r10, rsi
+mov r11, rcx
+
+cmp r13, r12
+jae parse_stmt_checkequ
+movb rax, [r13+0]
+cmp rax, CH_COLON
+jne parse_stmt_checkequ
+
+add r13, 1
+mov rsi, r10
+mov rcx, r11
+call find_or_create_symbol
+call define_label
+call skip_ws
+call skip_to_eol
+ret
+
+parse_stmt_checkequ:
+call skip_ws
+cmp r13, r12
+jae parse_stmt_dispatch
+mov rsi, r13
+mov rcx, 3
+mov rdi, lit_equ
+mov rdx, 3
+call bytes_eq
+cmp rax, 1
+jne parse_stmt_dispatch
+mov rax, r13
+add rax, 3
+cmp rax, r12
+jae parse_stmt_isequ
+movb rax, [rax+0]
+mov rdx, class_tbl
+add rdx, rax
+movb rdx, [rdx+0]
+and rdx, CLS_ICONT
+cmp rdx, 0
+jne parse_stmt_dispatch
+parse_stmt_isequ:
+add r13, 3
+mov rsi, r10
+mov rcx, r11
+call find_or_create_symbol
+mov r9, rax
+call skip_ws
+call parse_imm
+mov rdx, rax
+mov rax, r9
+call define_const
+call skip_ws
+call skip_to_eol
+ret
+
+; SWAR dispatch: pack+mask the candidate word ONCE (content and length
+; both folded into one qword), then each mnemonic check is a single
+; cmp/je -- no per-candidate call, no byte loop. Bucketed by first byte
+; first (a plain compare chain, since this dialect has no `dq label`
+; jump-table support to do it branchlessly), so a run starting with a
+; letter no mnemonic uses skips the whole rest of the chain immediately.
+parse_stmt_dispatch:
+mov rdi, r10
+mov rcx, r11
+call swar_pack
+mov r8, rax                         ; r8 = masked packed candidate word
+movb r9, [r10+0]                    ; r9 = first byte, for bucketing
+
+cmp r9, 97                          ; 'a': add, and
+jne parse_stmt_bucket_c
+cmp r8, PACK_ADD
+je parse_stmt_call_add
+cmp r8, PACK_AND
+je parse_stmt_call_and
+jmp die_unknown_mnem
+
+parse_stmt_bucket_c:
+cmp r9, 99                          ; 'c': cmp, call
+jne parse_stmt_bucket_d
+cmp r8, PACK_CMP
+je parse_stmt_call_cmp
+cmp r8, PACK_CALL
+je parse_stmt_call_call
+jmp die_unknown_mnem
+
+parse_stmt_bucket_d:
+cmp r9, 100                         ; 'd': db
+jne parse_stmt_bucket_i
+cmp r8, PACK_DB
+je parse_stmt_call_db
+jmp die_unknown_mnem
+
+parse_stmt_bucket_i:
+cmp r9, 105                         ; 'i': imul
+jne parse_stmt_bucket_j
+cmp r8, PACK_IMUL
+je parse_stmt_call_imul
+jmp die_unknown_mnem
+
+parse_stmt_bucket_j:
+cmp r9, 106                         ; 'j': jmp, je, jne, jl, jae
+jne parse_stmt_bucket_l
+cmp r8, PACK_JMP
+je parse_stmt_call_jmp
+cmp r8, PACK_JE
+je parse_stmt_call_je
+cmp r8, PACK_JNE
+je parse_stmt_call_jne
+cmp r8, PACK_JL
+je parse_stmt_call_jl
+cmp r8, PACK_JAE
+je parse_stmt_call_jae
+jmp die_unknown_mnem
+
+parse_stmt_bucket_l:
+cmp r9, 108                         ; 'l': lea
+jne parse_stmt_bucket_m
+cmp r8, PACK_LEA
+je parse_stmt_call_lea
+jmp die_unknown_mnem
+
+parse_stmt_bucket_m:
+cmp r9, 109                         ; 'm': mov, movb, movw, movd
+jne parse_stmt_bucket_n
+cmp r8, PACK_MOV
+je parse_stmt_call_mov
+cmp r8, PACK_MOVB
+je parse_stmt_call_movb
+cmp r8, PACK_MOVW
+je parse_stmt_call_movw
+cmp r8, PACK_MOVD
+je parse_stmt_call_movd
+jmp die_unknown_mnem
+
+parse_stmt_bucket_n:
+cmp r9, 110                         ; 'n': neg
+jne parse_stmt_bucket_o
+cmp r8, PACK_NEG
+je parse_stmt_call_neg
+jmp die_unknown_mnem
+
+parse_stmt_bucket_o:
+cmp r9, 111                         ; 'o': or
+jne parse_stmt_bucket_p
+cmp r8, PACK_OR
+je parse_stmt_call_or
+jmp die_unknown_mnem
+
+parse_stmt_bucket_p:
+cmp r9, 112                         ; 'p': push, pop
+jne parse_stmt_bucket_r
+cmp r8, PACK_PUSH
+je parse_stmt_call_push
+cmp r8, PACK_POP
+je parse_stmt_call_pop
+jmp die_unknown_mnem
+
+parse_stmt_bucket_r:
+cmp r9, 114                         ; 'r': ret
+jne parse_stmt_bucket_s
+cmp r8, PACK_RET
+je parse_stmt_call_ret
+jmp die_unknown_mnem
+
+parse_stmt_bucket_s:
+cmp r9, 115                         ; 's': syscall, sub, shl, shr
+jne parse_stmt_bucket_t
+mov rax, PACK_SYSCALL               ; 7 bytes -- doesn't fit the 32-bit
+cmp r8, rax                         ; imm cmp encodes (unlike every other
+je parse_stmt_call_syscall          ; PACK_* here, all <=4 ASCII bytes,
+                                    ; so always sign-extend safely); load
+                                    ; it via mov's real imm64 form instead
+cmp r8, PACK_SUB
+je parse_stmt_call_sub
+cmp r8, PACK_SHL
+je parse_stmt_call_shl
+cmp r8, PACK_SHR
+je parse_stmt_call_shr
+jmp die_unknown_mnem
+
+parse_stmt_bucket_t:
+cmp r9, 116                         ; 't': test
+jne parse_stmt_bucket_x
+cmp r8, PACK_TEST
+je parse_stmt_call_test
+jmp die_unknown_mnem
+
+parse_stmt_bucket_x:
+cmp r9, 120                         ; 'x': xor
+jne die_unknown_mnem
+cmp r8, PACK_XOR
+je parse_stmt_call_xor
+jmp die_unknown_mnem
+
+parse_stmt_call_mov:
+call do_mov
+ret
+parse_stmt_call_movb:
+call do_movb
+ret
+parse_stmt_call_movw:
+call do_movw
+ret
+parse_stmt_call_movd:
+call do_movd
+ret
+parse_stmt_call_syscall:
+call do_syscall
+ret
+parse_stmt_call_ret:
+call do_ret
+ret
+parse_stmt_call_db:
+call do_db
+ret
+parse_stmt_call_lea:
+call do_lea
+ret
+parse_stmt_call_imul:
+call do_imul
+ret
+parse_stmt_call_test:
+call do_test
+ret
+parse_stmt_call_neg:
+call do_neg
+ret
+parse_stmt_call_add:
+call do_add
+ret
+parse_stmt_call_sub:
+call do_sub
+ret
+parse_stmt_call_and:
+call do_and
+ret
+parse_stmt_call_or:
+call do_or
+ret
+parse_stmt_call_xor:
+call do_xor
+ret
+parse_stmt_call_cmp:
+call do_cmp
+ret
+parse_stmt_call_shl:
+call do_shl
+ret
+parse_stmt_call_shr:
+call do_shr
+ret
+parse_stmt_call_jmp:
+call do_jmp
+ret
+parse_stmt_call_je:
+call do_je
+ret
+parse_stmt_call_jne:
+call do_jne
+ret
+parse_stmt_call_jl:
+call do_jl
+ret
+parse_stmt_call_jae:
+call do_jae
+ret
+parse_stmt_call_call:
+call do_call
+ret
+parse_stmt_call_push:
+call do_push
+ret
+parse_stmt_call_pop:
+call do_pop
+ret
+
+; ===========================================================================
+; .text / .data -- switch which buffer r15 (the output bump pointer) is
+; currently advancing through. Symmetric: save the outgoing section's
+; cursor into its own slot, load the incoming section's saved cursor into
+; r15, update the current-section flag. A no-op if already in that
+; section (e.g. two ".text" in a row).
+; ===========================================================================
+do_section_text:
+mov rax, rbx
+add rax, CUR_SECTION_OFF
+mov rcx, [rax+0]
+cmp rcx, SEC_TEXT
+je do_section_text_done
+mov rdx, rbx
+add rdx, SAVED_DATA_R15_OFF
+mov [rdx+0], r15
+mov rdx, rbx
+add rdx, SAVED_TEXT_R15_OFF
+mov r15, [rdx+0]
+mov rcx, SEC_TEXT
+mov [rax+0], rcx
+do_section_text_done:
+call skip_ws
+call skip_to_eol
+ret
+
+do_section_data:
+mov rax, rbx
+add rax, CUR_SECTION_OFF
+mov rcx, [rax+0]
+cmp rcx, SEC_DATA
+je do_section_data_done
+mov rdx, rbx
+add rdx, SAVED_TEXT_R15_OFF
+mov [rdx+0], r15
+mov rdx, rbx
+add rdx, SAVED_DATA_R15_OFF
+mov r15, [rdx+0]
+mov rcx, SEC_DATA
+mov [rax+0], rcx
+do_section_data_done:
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
+; die_* -- error exits. fd 2, distinct message each, status 1.
+;   Messages are NUL-terminated and die() computes the length at runtime
+;   by scanning for that 0 byte -- this dialect's equ takes only a literal
+;   number (no NASM-style "$ - label" expression), so hand-counting every
+;   message's byte length would be pure transcription risk for no benefit.
+; ===========================================================================
+die_mmap:
+mov rdi, msg_mmap
+jmp die
+die_open:
+mov rdi, msg_open
+jmp die
+die_read:
+mov rdi, msg_read
+jmp die
+die_input_too_large:
+mov rdi, msg_toolarge
+jmp die
+die_write:
+mov rdi, msg_write
+jmp die
+die_unknown_mnem:
+mov rdi, msg_unknown
+jmp die_at_line
+die_bad_operand:
+mov rdi, msg_operand
+jmp die_at_line
+die_dup_label:
+mov rdi, msg_dup
+jmp die_at_line
+die_undef_label:
+mov rdi, msg_undef
+jmp die_at_line
+die_toomany_syms:
+mov rdi, msg_toomanysyms
+jmp die_at_line
+die_toomany_fixups:
+mov rdi, msg_toomanyfix
+jmp die_at_line
+die_imm_range:
+mov rdi, msg_immrange
+jmp die_at_line
+die_disp_range:
+mov rdi, msg_disprange
+jmp die_at_line
+
+; write_cstr_fd2 -- in: rdi = NUL-terminated string ptr -> writes it to fd 2
+write_cstr_fd2:
+mov rsi, rdi
+mov rcx, 0
+wcf_loop:
+movb rax, [rsi+0]
+cmp rax, 0
+je wcf_done
+add rsi, 1
+add rcx, 1
+jmp wcf_loop
+wcf_done:
+mov rdx, rcx
+mov rsi, rdi
+mov rdi, 2
+mov rax, SYS_write
+syscall
+ret
+
+; die -- rdi = NUL-terminated message (already has its own trailing
+; newline). For I/O-level failures (mmap/read/write), no line number.
+die:
+call write_cstr_fd2
+mov rdi, 1
+mov rax, SYS_exit
+syscall
+
+; die_at_line -- rdi = NUL-terminated message (NO trailing newline).
+; Appends " at line N\n" using the running line counter, then exits 1.
+die_at_line:
+call write_cstr_fd2
+mov rdi, msg_atline
+call write_cstr_fd2
+mov rax, rbx
+add rax, LINE_OFF
+mov rax, [rax+0]
+call print_udec
+mov rdi, msg_nl
+call write_cstr_fd2
+mov rdi, 1
+mov rax, SYS_exit
+syscall
+
+; ===========================================================================
+; print_udec -- rax = unsigned value; writes its decimal digits to fd 2.
+; No div/imul in this dialect, so digits come from repeated subtraction
+; against a fixed set of powers of ten (largest first), skipping leading
+; zeros. Buffers into the red zone, then one write for the whole number.
+;   clob: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11
+; ===========================================================================
+print_udec:
+mov r8, rax
+mov r9, rsp
+sub r9, 40
+mov r10, 0
+mov r11, 0
+mov rax, 100000000
+call pud_digit
+mov rax, 10000000
+call pud_digit
+mov rax, 1000000
+call pud_digit
+mov rax, 100000
+call pud_digit
+mov rax, 10000
+call pud_digit
+mov rax, 1000
+call pud_digit
+mov rax, 100
+call pud_digit
+mov rax, 10
+call pud_digit
+mov rax, 1
+call pud_digit
+mov rsi, r9
+mov rdx, r10
+mov rdi, 2
+mov rax, SYS_write
+syscall
+ret
+
+; pud_digit -- in: rax = this digit's power of ten; r8 = remaining value
+; (updated in place); r9 = buffer base; r10 = write index (updated);
+; r11 = "seen a nonzero digit yet" flag (updated). Emits nothing for a
+; leading zero digit, except the ones place (power=1), which always emits
+; (so that the value 0 itself still prints one digit).
+pud_digit:
+mov rcx, 0
+pud_digit_loop:
+cmp r8, rax
+jl pud_digit_done
+sub r8, rax
+add rcx, 1
+jmp pud_digit_loop
+pud_digit_done:
+cmp rcx, 0
+jne pud_digit_mark
+cmp r11, 0
+jne pud_digit_write
+cmp rax, 1
+je pud_digit_write
+ret
+pud_digit_mark:
+mov r11, 1
+pud_digit_write:
+add rcx, 48
+mov rdx, r9
+add rdx, r10
+movb [rdx+0], rcx
+add r10, 1
+ret
+
+; === read-only data =========================================================
+msg_mmap:
+db "v1: mmap failed"
+db 10
+db 0
+msg_open:
+db "v1: could not open input or output file"
+db 10
+db 0
+msg_read:
+db "v1: read failed"
+db 10
+db 0
+msg_toolarge:
+db "v1: input exceeds buffer capacity"
+db 10
+db 0
+msg_write:
+db "v1: write failed"
+db 10
+db 0
+msg_unknown:
+db "v1: unknown mnemonic"
+db 0
+msg_operand:
+db "v1: bad operand"
+db 0
+msg_dup:
+db "v1: duplicate label"
+db 0
+msg_undef:
+db "v1: undefined label"
+db 0
+msg_toomanysyms:
+db "v1: too many symbols"
+db 0
+msg_toomanyfix:
+db "v1: too many fixups"
+db 0
+msg_immrange:
+db "v1: immediate out of range"
+db 0
+msg_disprange:
+db "v1: displacement out of range"
+db 0
+msg_atline:
+db " at line "
+db 0
+msg_nl:
+db 10
+db 0
+
+; reg_table entry = { u8 name_len, u8 reg_num, u8 pad, char name[8] } --
+; fixed 11-byte stride, built as one db statement per byte/string chunk
+; since this dialect's db takes exactly one string or one numeric value,
+; never a comma-separated list.
+reg_table:
+db 3
+db 0
+db 0
+db "rax"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 1
+db 0
+db "rcx"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 2
+db 0
+db "rdx"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 3
+db 0
+db "rbx"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 4
+db 0
+db "rsp"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 5
+db 0
+db "rbp"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 6
+db 0
+db "rsi"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 7
+db 0
+db "rdi"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 2
+db 8
+db 0
+db "r8"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 2
+db 9
+db 0
+db "r9"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 10
+db 0
+db "r10"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 11
+db 0
+db "r11"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 12
+db 0
+db "r12"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 13
+db 0
+db "r13"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 14
+db 0
+db "r14"
+db 0
+db 0
+db 0
+db 0
+db 0
+db 3
+db 15
+db 0
+db "r15"
+db 0
+db 0
+db 0
+db 0
+db 0
+
+; "equ" is still checked via bytes_eq in parse_stmt_checkequ (a one-off
+; peek, not worth its own SWAR path); every mnemonic literal that used to
+; back the old bytes_eq dispatch chain is gone now that dispatch is
+; SWAR+bucketed (see PACK_* constants and parse_stmt_dispatch above).
+lit_equ:
+db "equ"
+
+; ===========================================================================
+; class_tbl -- 256-byte branchless character classification table (bits:
+; CLS_SPACE=1 CLS_NL=2 CLS_ISTART=4 CLS_ICONT=8 CLS_DIGIT=16 CLS_HEX=32).
+; Generated mechanically (see tests/), not hand-transcribed, to keep this
+; 256-entry table free of the kind of transposition error that bit the
+; ELF header build earlier in this file's history.
+; ===========================================================================
+class_tbl:
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 1
+db 2
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 1
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 56
+db 56
+db 56
+db 56
+db 56
+db 56
+db 56
+db 56
+db 56
+db 56
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 44
+db 44
+db 44
+db 44
+db 44
+db 44
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 0
+db 0
+db 0
+db 0
+db 12
+db 0
+db 44
+db 44
+db 44
+db 44
+db 44
+db 44
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 12
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0
+db 0

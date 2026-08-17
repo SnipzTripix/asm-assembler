@@ -1,0 +1,21 @@
+; sections.v0 -- exercises real .text/.data separation: code and a
+; string literal end up in different PT_LOAD segments (R+X vs R), and
+; the string's address is still resolved correctly via the ordinary
+; ABS64 label-fixup mechanism despite living in a different segment
+; than the instruction referencing it.
+mov rax, 1
+mov rdi, 1
+mov rsi, msg
+mov rdx, 14
+syscall
+mov rax, 60
+mov rdi, 0
+syscall
+
+.data
+msg:
+db "in .data now\n"
+
+.text
+extra:
+ret
