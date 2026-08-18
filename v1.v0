@@ -5,6 +5,9 @@
 ; Takes filenames as argv[1]/argv[2] (output gets mode 0755, no separate
 ; chmod needed); either or both can be omitted, falling back to stdin/
 ; stdout, so `./v1 < in > out` keeps working exactly as it always did.
+; argv[3] is a worker count for parallel assembly (default 1); the output
+; is byte-identical whatever it is set to -- see the PARALLEL ASSEMBLY
+; section for how that guarantee is kept.
 ; seed.asm/seed is retired: it only exists to have bootstrapped this file
 ; once, and is kept around for the historical record and its differential
 ; test against nasm, not because anything still depends on it.
@@ -74,10 +77,13 @@ SYS_write       equ 1
 SYS_open        equ 2
 SYS_close       equ 3
 SYS_mmap        equ 9
+SYS_fork        equ 57
 SYS_exit        equ 60
+SYS_wait4       equ 61
 O_RDONLY        equ 0
 O_WRONLY_CREAT_TRUNC equ 577       ; O_WRONLY(1)|O_CREAT(64)|O_TRUNC(512)
 MODE_755        equ 493            ; rwxr-xr-x
+MAP_SHARED_ANON equ 0x21           ; MAP_SHARED(1)|MAP_ANONYMOUS(0x20)
 PROT_RW         equ 3
 MAP_ANON        equ 0x22
 
@@ -117,7 +123,85 @@ SAVED_DATA_R15_OFF equ 0xD800018         ; while it isn't the active one
 DATA_FILE_START_OFF equ 0xD800020        ; set once by resolve_fixups
 INPUT_FD_OFF    equ 0xD800028            ; argv[1]-opened fd, else 0 (stdin)
 OUTPUT_FD_OFF   equ 0xD800030            ; argv[2]-opened fd, else 1 (stdout)
-MMAP_TOTAL      equ 0xD800038
+
+; --- parallel assembly state (see the "parallel" section further down) ---
+JOBS_OFF        equ 0xD800038            ; worker count; 1 = serial path
+SHARED_OFF      equ 0xD800040            ; base of the MAP_SHARED result area
+MYJOB_OFF       equ 0xD800048            ; which chunk this process owns
+DEFLIST_META_OFF equ 0xD800050           ; count of labels defined locally
+PAR_NEEDSYM_OFF equ 0xD800058            ; nonzero if any worker deferred a
+                                          ; fixup, i.e. if the merge actually
+                                          ; needs a symbol table at all
+CHUNKTAB_OFF    equ 0xD800060            ; MAX_JOBS * {start,end,section,pad}
+PAR_FILTER_OFF  equ 0xE100000            ; 64 KiB byte-per-slot filter over
+                                          ; the low 16 bits of a name hash:
+                                          ; marks which names some deferred
+                                          ; fixup actually wants, so the
+                                          ; merge can skip installing the
+                                          ; (vast majority of) labels that
+                                          ; nothing outside their own chunk
+                                          ; ever refers to
+PAR_FILTER_MASK equ 0xFFFF
+SYMMASK_OFF     equ 0xE110000            ; runtime symbol-table mask. The
+                                          ; table is sized for the WHOLE
+                                          ; file, but a worker only holds a
+                                          ; 1/N share of it, and probing a
+                                          ; 16 MiB table scatters those few
+                                          ; entries across every page of a
+                                          ; private COW copy -- 16 workers
+                                          ; then fault in 16 tables' worth
+                                          ; of pages. Shrinking each
+                                          ; worker's mask keeps the total
+                                          ; pages touched the same as serial.
+PAR_CONST_META_OFF equ 0xE110008         ; count of prescan-harvested equ
+PAR_CONST_OFF   equ 0xE120000            ; {name_ptr, name_len, value, pad}
+PAR_CONST_ENT   equ 32
+PAR_CONST_CAP   equ 32768
+DEFLIST_OFF     equ 0xD900000            ; 8 MiB of symbol-slot pointers, one
+                                          ; per label THIS process defined --
+                                          ; a worker has to hand its labels to
+                                          ; the parent, and walking the whole
+                                          ; 16 MiB hash table to find them
+                                          ; would cost more than the work it
+                                          ; just did
+MMAP_TOTAL      equ 0xE220000
+
+MAX_JOBS        equ 16
+PAR_MIN_BYTES   equ 262144               ; below ~256 KiB the fork+merge
+                                          ; overhead exceeds what parallel
+                                          ; assembly saves, so -j is ignored
+CHUNK_ENT       equ 32                   ; {start:8, end:8, section:8, pad:8}
+
+; --- one MAP_SHARED slot per worker: the only memory a worker and the
+; parent both see. Everything else a worker touches is copy-on-write
+; private, which is exactly why no locking is needed anywhere: workers
+; never write to shared state except their own slot, and the parent only
+; reads a slot after wait4 has confirmed that worker exited. ---
+SLOT_SIZE       equ 0x1000000            ; 16 MiB per worker
+SLOT_TEXT_OFF   equ 0x1000               ; meta lives in the first 4 KiB
+SLOT_TEXT_CAP   equ 0x600000             ; 6 MiB
+SLOT_DATA_OFF   equ 0x601000
+SLOT_DATA_CAP   equ 0x400000             ; 4 MiB
+SLOT_SYM_OFF    equ 0xA01000
+SLOT_SYM_CAP    equ 0x200000             ; 2 MiB / 32 B = 65536 labels
+SLOT_FIX_OFF    equ 0xC01000
+SLOT_FIX_CAP    equ 0x300000             ; 3 MiB / 48 B = 65536 fixups
+SHARED_TOTAL    equ 0x10000000           ; MAX_JOBS * SLOT_SIZE = 256 MiB
+
+; slot meta fields
+SM_TEXTSZ       equ 0
+SM_DATASZ       equ 8
+SM_NSYM         equ 16
+SM_NFIX         equ 24
+SM_ERR          equ 32                   ; 0 = ok, else a msg id (see wk_die)
+SM_ERRLINE      equ 40
+
+SSYM_ENT        equ 64                   ; {name_ptr, name_len, value, section,
+                                          ;  hash} -- power of 2 so indexing
+                                          ;  is a shift; the hash rides along
+                                          ;  so the parent never re-runs FNV
+SFIX_ENT        equ 48                   ; {patch_off, patch_sec, kind,
+                                          ;  name_ptr, name_len, target_hash}
 HDR_LEN         equ 176                  ; Ehdr(64) + 2 * Phdr(56) -- one
                                          ; PT_LOAD each for text (R+X) and
                                          ; data (R)
@@ -150,6 +234,11 @@ REG_ENT_LEN     equ 11
 LOAD_BASE       equ 0x400000
 FNV_OFFSET      equ 0xCBF29CE484222325
 FNV_PRIME       equ 0x100000001B3
+
+; --- SWAR constants for the 8-byte-at-a-time newline scan ---
+SWAR_NL         equ 0x0A0A0A0A0A0A0A0A
+SWAR_ONES       equ 0x0101010101010101
+SWAR_HIGHS      equ 0x8080808080808080
 
 ; --- sentinels / two's-complement constants (dialect has no negative
 ; immediates; grp1-imm ops truncate to 32 bits and the CPU sign-extends at
@@ -261,6 +350,41 @@ cmp rax, 0
 jl die_open
 mov r14, rax
 start_argv_done:
+; argv[3] = worker count (default 1 = the original serial path). Parsed
+; here, before mmap, and stashed in r11 -- the private region it will
+; live in does not exist yet.
+mov r11, 1
+mov rax, [rsp+0]
+cmp rax, 4
+jl start_jobs_done
+mov rsi, [rsp+32]                   ; argv[3]
+mov r11, 0
+start_jobs_digit:
+movb rax, [rsi+0]
+cmp rax, CH_0
+jl start_jobs_check
+cmp rax, CH_9PLUS1
+jae start_jobs_check
+sub rax, CH_0
+mov rcx, r11
+shl r11, 3
+shl rcx, 1
+add r11, rcx                        ; r11 = r11*10 (no imul before the
+add r11, rax                        ; encoder is even mapped in)
+add rsi, 1
+jmp start_jobs_digit
+start_jobs_check:
+cmp r11, 1
+jl start_jobs_bad
+cmp r11, MAX_JOBS
+jae start_jobs_clamp
+jmp start_jobs_done
+start_jobs_clamp:
+mov r11, MAX_JOBS
+jmp start_jobs_done
+start_jobs_bad:
+mov r11, 1
+start_jobs_done:
 
 mov rdi, 0
 mov rsi, MMAP_TOTAL
@@ -268,11 +392,13 @@ mov rdx, PROT_RW
 mov r10, MAP_ANON
 mov r8, NEG_ONE
 mov r9, 0
-mov rax, SYS_mmap
-syscall
-cmp rax, MMAP_ERR_THRESH
-jae die_mmap
-mov rbx, rax
+push r11                            ; syscall clobbers rcx and r11 (it
+mov rax, SYS_mmap                   ; parks the return address and RFLAGS
+syscall                             ; there) -- the job count cannot ride
+pop r11                             ; through in r11, and when it did, the
+cmp rax, MMAP_ERR_THRESH            ; garbage left behind made every run
+jae die_mmap                        ; think it should fork, which is a
+mov rbx, rax                        ; fork bomb, not a bug you debug twice
 
 mov rax, rbx
 add rax, INPUT_FD_OFF
@@ -280,6 +406,41 @@ mov [rax+0], r13
 mov rax, rbx
 add rax, OUTPUT_FD_OFF
 mov [rax+0], r14
+mov rax, rbx
+add rax, JOBS_OFF
+mov [rax+0], r11
+mov rax, rbx
+add rax, MYJOB_OFF                  ; the parent is not a worker; workers
+mov rcx, NEG_ONE                    ; overwrite this with their index
+mov [rax+0], rcx
+mov rax, rbx
+add rax, SYMMASK_OFF                ; full-size table unless a worker
+mov rcx, SYM_CAP_MASK               ; narrows it for itself
+mov [rax+0], rcx
+
+; --- MAP_SHARED result area, only when actually running parallel ---
+mov rax, rbx
+add rax, SHARED_OFF
+mov rcx, 0
+mov [rax+0], rcx
+cmp r11, 1
+je start_no_shared
+push r11
+mov rdi, 0
+mov rsi, SHARED_TOTAL
+mov rdx, PROT_RW
+mov r10, MAP_SHARED_ANON
+mov r8, NEG_ONE
+mov r9, 0
+mov rax, SYS_mmap
+syscall
+pop r11
+cmp rax, MMAP_ERR_THRESH
+jae die_mmap
+mov rcx, rbx
+add rcx, SHARED_OFF
+mov [rcx+0], rax
+start_no_shared:
 
 mov r14, rbx
 add r14, TEXTBUF_OFF             ; r14 = text buffer base, constant for
@@ -347,6 +508,29 @@ mov rcx, rbx
 add rcx, DATABUF_OFF
 mov [rax+0], rcx
 
+; --- fork out to the parallel driver when more than one worker was asked
+; for. par_assemble returns only in the parent, with everything merged and
+; both section cursors set, ready for the shared output stage. ---
+; Below a certain size, forking and merging costs more than the assembly
+; itself, so a small file quietly falls back to the serial path: asking
+; for workers should never make a build slower than not asking.
+mov rax, r12
+sub rax, rbx                        ; input length
+cmp rax, PAR_MIN_BYTES
+jae par_size_ok
+mov rax, rbx
+add rax, JOBS_OFF
+mov rcx, 1
+mov [rax+0], rcx
+par_size_ok:
+mov rax, rbx
+add rax, JOBS_OFF
+mov rax, [rax+0]
+cmp rax, 1
+je stmt_loop
+call par_assemble
+jmp build_output
+
 stmt_loop:
 cmp r13, r12
 jae parse_done
@@ -372,12 +556,21 @@ comment_line:
 call skip_to_eol
 jmp stmt_loop
 parse_done:
+; a worker stops here: its chunk is assembled but nothing can be resolved
+; until every other chunk's labels are known, which only the parent sees
+mov rax, rbx
+add rax, MYJOB_OFF
+mov rax, [rax+0]
+cmp rax, NEG_ONE
+jne par_worker_emit
+
 call resolve_fixups                 ; also finalizes both section sizes
                                     ; and DATA_FILE_START -- read those
                                     ; back out instead of trusting live
                                     ; r15, which may currently be in
                                     ; whichever section wasn't scanned last
 
+build_output:
 mov rax, rbx
 add rax, SAVED_TEXT_R15_OFF
 mov rax, [rax+0]
@@ -978,14 +1171,24 @@ pop rcx
 pop rsi
 mov r8, rax                         ; r8 = hash
 mov r9, rax
-and r9, SYM_CAP_MASK                ; r9 = probe index
+mov rdx, rbx
+add rdx, SYMMASK_OFF
+mov rdx, [rdx+0]                    ; runtime mask (see SYMMASK_OFF)
+and r9, rdx                         ; r9 = probe index
 focs_probe:
 mov r10, r9
 shl r10, 6                          ; *64 (SYM_ENT)
 mov r11, rbx
 add r11, SYMTAB_OFF
 add r10, r11                        ; r10 = slot address
-mov rax, [r10+32]                   ; status
+; "Is this slot free?" must test the NAME, not the status. A symbol
+; referenced before it is defined lives here as a placeholder with
+; status 0, and testing status would call that slot empty and let the
+; next colliding name overwrite it -- silently re-pointing every fixup
+; that already recorded this slot's address at a different symbol. That
+; is a wrong encoding, not an error, and it stayed hidden for as long as
+; the table was so large that collisions never happened.
+mov rax, [r10+8]                    ; name_ptr: zero only if never used
 cmp rax, 0
 je focs_create
 mov rax, [r10+0]                    ; stored hash
@@ -1003,7 +1206,10 @@ mov rax, r10
 ret
 focs_next:
 add r9, 1
-and r9, SYM_CAP_MASK
+mov rdx, rbx
+add rdx, SYMMASK_OFF
+mov rdx, [rdx+0]
+and r9, rdx
 jmp focs_probe
 focs_create:
 mov r11, rbx
@@ -1060,6 +1266,20 @@ mov [r9+24], rcx                    ; value (offset within its section)
 mov [r9+40], rdx                    ; section
 mov rdx, 1
 mov [r9+32], rdx                    ; status
+; Record the slot in this process's defined-label list. Serial runs never
+; read the list; a parallel worker walks it to tell the parent which
+; labels it defined, which is far cheaper than rescanning the hash table.
+mov rax, rbx
+add rax, DEFLIST_META_OFF
+mov rcx, [rax+0]
+mov rdx, rcx
+shl rdx, 3
+mov rsi, rbx
+add rsi, DEFLIST_OFF
+add rdx, rsi
+mov [rdx+0], r9
+add rcx, 1
+mov [rax+0], rcx
 ret
 
 ; ===========================================================================
@@ -1070,7 +1290,23 @@ define_const:
 mov r9, rax
 mov rax, [r9+32]
 cmp rax, 0
+je define_const_fresh
+; Already defined. In a worker that is expected: par_prescan harvested
+; every `equ` in the file into the shared (COW) table before forking, and
+; the worker is now re-reading the very line it came from, so redefining
+; it to the same value is a no-op rather than a duplicate. A genuine
+; duplicate constant is still caught -- by the prescan itself, in the
+; parent, before any worker exists. A name that is already a LABEL is a
+; real collision either way.
+cmp rax, 2
 jne die_dup_label
+mov rax, rbx
+add rax, MYJOB_OFF
+mov rax, [rax+0]
+cmp rax, NEG_ONE
+je die_dup_label
+ret
+define_const_fresh:
 mov [r9+24], rdx
 mov rdx, 2
 mov [r9+32], rdx
@@ -1095,14 +1331,17 @@ pop rcx
 pop rsi
 mov r8, rax
 mov r9, rax
-and r9, SYM_CAP_MASK
+mov rdx, rbx
+add rdx, SYMMASK_OFF
+mov rdx, [rdx+0]
+and r9, rdx
 trc_probe:
 mov r10, r9
 shl r10, 6
 mov r11, rbx
 add r11, SYMTAB_OFF
 add r10, r11
-mov rax, [r10+32]
+mov rax, [r10+8]                    ; free slot = no name (see focs_probe)
 cmp rax, 0
 je trc_notfound
 mov rax, [r10+0]
@@ -1124,7 +1363,10 @@ mov rdx, 1
 ret
 trc_next:
 add r9, 1
-and r9, SYM_CAP_MASK
+mov rdx, rbx
+add rdx, SYMMASK_OFF
+mov rdx, [rdx+0]
+and r9, rdx
 jmp trc_probe
 trc_notfound:
 mov rax, 0
@@ -1344,6 +1586,1246 @@ rf_next:
 add r9, 1
 jmp rf_loop
 rf_done:
+ret
+
+; ===========================================================================
+; mem_copy -- rdi = dst, rsi = src, rcx = length. Copies 8 bytes at a
+; time with a byte tail; the merge moves megabytes, and a pure byte loop
+; there costs more than the assembly it is stitching together.
+;   clob: rax, rcx, rdx, rsi, rdi
+; ===========================================================================
+mem_copy:
+mem_copy_q:
+cmp rcx, 8
+jl mem_copy_tail
+mov rax, [rsi+0]
+mov [rdi+0], rax
+add rsi, 8
+add rdi, 8
+sub rcx, 8
+jmp mem_copy_q
+mem_copy_tail:
+cmp rcx, 0
+je mem_copy_done
+movb rax, [rsi+0]
+movb [rdi+0], rax
+add rsi, 1
+add rdi, 1
+sub rcx, 1
+jmp mem_copy_tail
+mem_copy_done:
+ret
+
+; ===========================================================================
+; PARALLEL ASSEMBLY
+;
+; The unit of parallelism is a process, not a thread: fork() gives every
+; worker a copy-on-write clone of the entire address space, so each one
+; runs the ordinary, completely unmodified assembler over its own slice
+; of the source -- same encoder, same symbol table code, same emit path,
+; writing through r15 exactly as it always does. Nothing is shared and
+; nothing is locked, which is why no atomics are needed (and why none had
+; to be added to the dialect).
+;
+; The only shared memory is one MAP_SHARED slot per worker. A worker
+; writes only its own slot; the parent reads a slot only after wait4 has
+; told it that worker is gone, which is a full memory barrier by way of
+; the kernel. Determinism is preserved because the merge walks chunks in
+; index order, never completion order.
+;
+; What has to stay serial: the pre-scan (below) and the merge. The
+; pre-scan must run first because two pieces of state genuinely flow
+; forward through the file -- which section is current, and what the equ
+; constants are -- so a chunk cannot be assembled until they are known at
+; its start.
+; ===========================================================================
+par_assemble:
+call par_prescan
+call par_spawn
+call par_install_consts             ; the parent needs them too, in case a
+call par_merge                      ; deferred fixup names a constant
+ret
+
+; ===========================================================================
+; par_install_consts -- replay the pre-scan's constant array into whatever
+; symbol table the CURRENT process is using. Called once by each worker
+; (into its small private table) and once by the parent (into the full
+; one). Constant counts are tiny, so doing this N+1 times costs nothing
+; next to the page faults it avoids.
+; ===========================================================================
+par_install_consts:
+mov rax, rbx
+add rax, PAR_CONST_META_OFF
+mov r8, [rax+0]                    ; how many constants the prescan found
+mov r9, 0
+pic_loop:
+cmp r9, r8
+jae pic_done
+mov rax, r9
+shl rax, 5                         ; * PAR_CONST_ENT
+mov rcx, rbx
+add rcx, PAR_CONST_OFF
+add rax, rcx
+mov rsi, [rax+0]                   ; name_ptr
+mov rcx, [rax+8]                   ; name_len
+mov rdx, [rax+16]                  ; value
+push r8
+push r9
+push rdx
+call find_or_create_symbol
+pop rdx
+call define_const
+pop r9
+pop r8
+add r9, 1
+jmp pic_loop
+pic_done:
+ret
+
+; ===========================================================================
+; fast_to_eol -- advance r13 past the next newline (or to the input end),
+; testing 8 bytes per iteration instead of one. Same job as skip_to_eol,
+; but this runs over the entire source in the serial pre-scan, where it
+; was the single largest cost and therefore the cap on how much parallel
+; assembly could ever win.
+;
+; The test is the classic zero-byte trick: XOR the word with a newline in
+; every lane, so a matching lane becomes 0x00, then (v-1) & ~v & 0x80 is
+; nonzero exactly when some lane is zero. On a hit, fall back to a byte
+; walk over those 8 bytes to land precisely.
+;
+; Reading 8 bytes may run past the last line, which is safe: the input
+; sits in a 64 MiB mapping far larger than any file read into it.
+;   clob: rax, rcx, rdx, rsi   (leaves r8-r11 alone: the pre-scan keeps
+;         its chunking state there)
+; ===========================================================================
+fast_to_eol:
+fte_loop:
+mov rax, r13
+add rax, 8
+cmp rax, r12
+jae fte_tail
+mov rax, [r13+0]
+mov rcx, SWAR_NL
+xor rax, rcx                       ; newline lanes become zero
+mov rdx, rax
+mov rcx, SWAR_ONES
+sub rdx, rcx                       ; v - 0x0101..
+mov rcx, rax
+mov rsi, NEG_ONE
+xor rcx, rsi                       ; ~v
+and rdx, rcx
+mov rcx, SWAR_HIGHS
+and rdx, rcx
+cmp rdx, 0
+jne fte_tail                       ; newline somewhere in these 8
+add r13, 8
+jmp fte_loop
+fte_tail:
+cmp r13, r12
+jae fte_done
+movb rax, [r13+0]
+add r13, 1
+cmp rax, CH_NL
+jne fte_tail
+fte_done:
+ret
+
+; ===========================================================================
+; par_prescan -- one serial pass over the source that does the minimum a
+; worker cannot do for itself: track .text/.data so each chunk knows the
+; section it starts in, harvest every `equ` constant into the symbol
+; table (workers inherit them through COW), count lines so a worker's
+; error messages carry a real line number, and cut the file into JOBS
+; chunks on line boundaries.
+;
+; Chunk k ends at the first line start where pos*JOBS >= (k+1)*total,
+; which places the cuts evenly without ever needing a divide.
+; ===========================================================================
+par_prescan:
+mov r13, rbx                        ; cursor
+mov rax, rbx
+add rax, JOBS_OFF
+mov r8, [rax+0]                     ; r8 = jobs
+mov r9, 0                           ; r9 = chunk index
+mov r10, rbx                        ; r10 = current chunk start
+mov r11, SEC_TEXT                   ; r11 = section at chunk start
+push r11                            ; [rsp] = running section
+mov rax, 1
+push rax                            ; [rsp+8] would be line... see below
+; stack: [rsp]=line number, [rsp+8]=running section
+; (pushed in that order so the two are addressable as [rsp+0]/[rsp+8])
+
+par_prescan_line:
+cmp r13, r12
+jae par_prescan_eof
+
+; --- chunk boundary check, at a line start ---
+mov rax, r9
+add rax, 1
+cmp rax, r8
+jae par_prescan_noboundary        ; last chunk runs to EOF
+mov rcx, r13
+sub rcx, rbx                       ; pos
+imul rcx, r8                       ; pos * jobs
+mov rdx, r12
+sub rdx, rbx                       ; total
+mov rsi, r9
+add rsi, 1
+imul rdx, rsi                      ; (k+1) * total
+cmp rcx, rdx
+jl par_prescan_noboundary
+; close chunk r9: [start, r13)
+mov rax, r9
+shl rax, 6
+mov rdi, rbx
+add rdi, CHUNKTAB_OFF
+add rax, rdi
+mov [rax+0], r10
+mov [rax+8], r13
+mov rcx, [rsp+8]
+mov [rax+16], rcx                  ; section this chunk began in
+mov rcx, [rsp+0]
+mov [rax+24], rcx                  ; line number this chunk begins on
+mov r10, r13
+add r9, 1
+par_prescan_noboundary:
+
+call skip_ws
+cmp r13, r12
+jae par_prescan_eof
+movb rax, [r13+0]
+cmp rax, CH_NL
+je par_prescan_blank
+cmp rax, CH_SEMI
+je par_prescan_comment
+cmp rax, CH_DOT
+je par_prescan_section
+
+; --- identifier: either a label, an `equ`, or an instruction ---
+call scan_ident
+cmp rcx, 0
+je par_prescan_comment
+mov rdi, rsi                       ; stash name ptr/len across the peek
+push rdi
+push rcx
+cmp r13, r12
+jae par_prescan_ident_done
+movb rax, [r13+0]
+cmp rax, CH_COLON
+je par_prescan_ident_done          ; label: workers handle it
+call skip_ws
+cmp r13, r12
+jae par_prescan_ident_done
+mov rsi, r13
+mov rcx, 3
+mov rdi, lit_equ
+mov rdx, 3
+call bytes_eq
+cmp rax, 1
+jne par_prescan_ident_done
+mov rax, r13
+add rax, 3
+cmp rax, r12
+jae par_prescan_isequ
+movb rax, [rax+0]
+mov rdx, class_tbl
+add rdx, rax
+movb rdx, [rdx+0]
+and rdx, CLS_ICONT
+cmp rdx, 0
+jne par_prescan_ident_done
+par_prescan_isequ:
+; Record the constant in a flat array rather than inserting it into the
+; hash table. Populating the table here would force every worker to
+; inherit those pages AND to keep the parent's full-size mask, which is
+; exactly the page-fault storm this avoids. Workers replay this array
+; into their own small tables instead.
+add r13, 3
+pop rcx
+pop rsi
+push r8                            ; parse_imm and the store below clobber
+push r9                            ; the registers holding chunk state
+push r10
+push rsi
+push rcx
+call skip_ws
+call parse_imm
+mov rdi, rax                       ; value
+pop rcx
+pop rsi
+mov rax, rbx
+add rax, PAR_CONST_META_OFF
+mov rdx, [rax+0]
+cmp rdx, PAR_CONST_CAP
+jae die_toomany_syms
+mov r8, rdx
+shl r8, 5                          ; * PAR_CONST_ENT (32)
+mov r9, rbx
+add r9, PAR_CONST_OFF
+add r8, r9
+mov [r8+0], rsi                    ; name_ptr
+mov [r8+8], rcx                    ; name_len
+mov [r8+16], rdi                   ; value
+add rdx, 1
+mov [rax+0], rdx
+pop r10
+pop r9
+pop r8
+jmp par_prescan_comment
+par_prescan_ident_done:
+pop rcx
+pop rdi
+jmp par_prescan_comment
+
+par_prescan_section:
+add r13, 1
+call scan_ident
+cmp rcx, 0
+je par_prescan_comment
+mov rdi, rsi
+push r8                            ; swar_pack uses r8 as its mask scratch
+call swar_pack
+pop r8
+cmp rax, PACK_TEXT
+je par_prescan_sec_text
+cmp rax, PACK_DATA
+je par_prescan_sec_data
+jmp par_prescan_comment
+par_prescan_sec_text:
+mov rax, SEC_TEXT
+mov [rsp+8], rax
+jmp par_prescan_comment
+par_prescan_sec_data:
+mov rax, SEC_DATA
+mov [rsp+8], rax
+jmp par_prescan_comment
+
+par_prescan_blank:
+add r13, 1
+mov rax, [rsp+0]
+add rax, 1
+mov [rsp+0], rax
+jmp par_prescan_line
+
+par_prescan_comment:
+call fast_to_eol
+mov rax, [rsp+0]
+add rax, 1
+mov [rsp+0], rax
+jmp par_prescan_line
+
+par_prescan_eof:
+; close the final chunk, and give any chunks we never reached an empty
+; range so the spawn/merge loops can treat all JOBS uniformly
+mov rax, r9
+shl rax, 6
+mov rdi, rbx
+add rdi, CHUNKTAB_OFF
+add rax, rdi
+mov [rax+0], r10
+mov [rax+8], r12
+mov rcx, [rsp+8]
+mov [rax+16], rcx
+mov rcx, [rsp+0]
+mov [rax+24], rcx
+add r9, 1
+par_prescan_pad:
+cmp r9, r8
+jae par_prescan_fin
+mov rax, r9
+shl rax, 6
+mov rdi, rbx
+add rdi, CHUNKTAB_OFF
+add rax, rdi
+mov [rax+0], r12
+mov [rax+8], r12
+mov rcx, SEC_TEXT
+mov [rax+16], rcx
+mov rcx, 1
+mov [rax+24], rcx
+add r9, 1
+jmp par_prescan_pad
+par_prescan_fin:
+pop rax
+pop rax
+ret
+
+; ===========================================================================
+; par_spawn -- fork one worker per chunk. The child never returns from
+; here: it re-points the cursor at its own chunk and falls into the
+; ordinary statement loop, which ends at parse_done, which sees a
+; non-negative MYJOB and diverts to par_worker_emit.
+; ===========================================================================
+par_spawn:
+mov rax, rbx
+add rax, JOBS_OFF
+mov r8, [rax+0]
+mov r9, 0
+par_spawn_loop:
+cmp r9, r8
+jae par_spawn_wait
+push r8
+push r9
+mov rax, SYS_fork
+syscall
+pop r9
+pop r8
+cmp rax, 0
+je par_spawn_child
+cmp rax, 0
+jl die_fork
+jmp par_spawn_next
+par_spawn_child:
+; --- in the worker now: private COW address space, own chunk ---
+mov rax, rbx
+add rax, MYJOB_OFF
+mov [rax+0], r9
+mov rax, r9
+shl rax, 6
+mov rdi, rbx
+add rdi, CHUNKTAB_OFF
+add rax, rdi
+mov r13, [rax+0]                   ; cursor  = chunk start
+mov r12, [rax+8]                   ; end     = chunk end
+mov rcx, [rax+16]
+mov rdx, rbx
+add rdx, CUR_SECTION_OFF
+mov [rdx+0], rcx                   ; section this chunk starts in
+mov rcx, [rax+24]
+mov rdx, rbx
+add rdx, LINE_OFF
+mov [rdx+0], rcx                   ; first line number of this chunk
+; both section cursors start at their buffer origins; text keeps the
+; HDR_LEN bias so a chunk-local label value needs no special casing at
+; merge time (final = local + this chunk's text base)
+mov r15, r14
+add r15, HDR_LEN
+mov rax, rbx
+add rax, SAVED_TEXT_R15_OFF
+mov [rax+0], r15
+mov rax, rbx
+add rax, SAVED_DATA_R15_OFF
+mov rcx, rbx
+add rcx, DATABUF_OFF
+mov [rax+0], rcx
+mov rax, rbx
+add rax, CUR_SECTION_OFF
+mov rax, [rax+0]
+cmp rax, SEC_DATA
+jne par_spawn_child_go
+mov r15, rbx
+add r15, DATABUF_OFF
+par_spawn_child_go:
+mov rax, rbx
+add rax, DEFLIST_META_OFF
+mov rcx, 0
+mov [rax+0], rcx
+mov rax, rbx
+add rax, FIXUPS_META_OFF
+mov rcx, 0
+mov [rax+0], rcx
+; Narrow this worker's symbol table to roughly its 1/N share. The table
+; is untouched in the parent, so each worker faults in only the pages its
+; own share actually spans -- without this, all N workers scatter their
+; labels across the full 16 MiB and fault in N whole tables' worth.
+; Round the worker count up to a power of two so the mask stays a mask.
+mov rax, rbx
+add rax, JOBS_OFF
+mov rax, [rax+0]
+mov rcx, 1                         ; rcx = rounded-up power of two
+pscw_round:
+cmp rcx, rax
+jae pscw_have
+shl rcx, 1
+jmp pscw_round
+pscw_have:
+mov rdx, SYM_CAP
+pscw_shift:
+cmp rcx, 1
+je pscw_masked
+shr rdx, 1
+shr rcx, 1
+jmp pscw_shift
+pscw_masked:
+sub rdx, 1                         ; slots-1 = mask
+mov rax, rbx
+add rax, SYMMASK_OFF
+mov [rax+0], rdx
+call par_install_consts
+jmp stmt_loop
+par_spawn_next:
+add r9, 1
+jmp par_spawn_loop
+
+par_spawn_wait:
+; reap every worker; any nonzero wait status means that worker already
+; printed its own diagnostic and exited nonzero, so just follow it out
+mov r9, 0
+par_spawn_wait_loop:
+cmp r9, r8
+jae par_spawn_done
+push r8
+push r9
+mov rdi, NEG_ONE
+mov rsi, rsp
+sub rsi, 64
+mov rcx, 0
+mov [rsi+0], rcx                   ; wait4 fills only the low 4 bytes, so
+                                    ; clear all 8 first -- reading stack
+                                    ; garbage in the top half would look
+                                    ; like a worker failure
+mov rdx, 0
+mov r10, 0
+mov rax, SYS_wait4
+syscall
+mov rcx, rsp
+sub rcx, 64
+mov rcx, [rcx+0]
+pop r9
+pop r8
+cmp rcx, 0
+jne par_worker_failed
+add r9, 1
+jmp par_spawn_wait_loop
+par_spawn_done:
+ret
+
+par_worker_failed:
+mov rdi, 1
+mov rax, SYS_exit
+syscall
+
+; ===========================================================================
+; par_worker_emit -- a worker has finished assembling its chunk; hand the
+; results to the parent through its MAP_SHARED slot and exit. Everything
+; written here is chunk-local; the parent rebases it during the merge.
+; ===========================================================================
+; ===========================================================================
+; par_worker_local_resolve -- patch every fixup this worker can settle by
+; itself, and compact the rest for export. This is what makes parallel
+; assembly actually pay: without it the parent has to hash and resolve
+; every reference in the file, serially, which costs more than it saved.
+;
+; A fixup is chunk-position-independent, and therefore resolvable here,
+; when moving the chunk cannot change the bytes:
+;   * rel32 whose target and patch site are in the SAME section -- both
+;     shift by that section's base at merge time, and the difference is
+;     all that gets encoded, so the base cancels. This covers essentially
+;     every jump and call in real code.
+;   * abs64 onto an `equ` constant -- a plain value, never an address, so
+;     no base and no load bias apply.
+; Everything else (cross-section rel32, abs64 onto a label) genuinely
+; depends on where the chunk lands, and is left for the parent.
+; ===========================================================================
+par_worker_local_resolve:
+mov rax, rbx
+add rax, FIXUPS_META_OFF
+mov r8, [rax+0]                    ; total fixups
+mov r9, 0                          ; read index
+mov r10, 0                         ; write index (compaction target)
+pwlr_loop:
+cmp r9, r8
+jae pwlr_done
+mov rax, r9
+shl rax, 5
+mov rcx, rbx
+add rcx, FIXUPS_OFF
+add rax, rcx                       ; rax = fixup record
+mov rsi, [rax+8]                   ; symbol slot
+mov rdi, [rsi+32]                  ; status
+cmp rdi, 0
+je pwlr_keep                       ; undefined here -- another chunk owns it
+mov rdx, [rax+16]                  ; kind
+cmp rdx, FIX_ABS64
+je pwlr_abs
+
+; --- rel32: only when both ends sit in the same section ---
+mov rcx, [rsi+40]                  ; target section
+mov rdx, [rax+24]                  ; patch section
+cmp rcx, rdx
+jne pwlr_keep
+mov rcx, [rsi+24]                  ; target value (section-relative)
+mov rdi, [rax+0]                   ; patch offset (section-relative)
+sub rcx, rdi
+sub rcx, 4                         ; rel32
+push rax
+push r8
+push r9
+push r10
+mov r11, rdx
+call par_local_site                ; rdi = address to patch
+mov rax, rcx
+call store_dword
+pop r10
+pop r9
+pop r8
+pop rax
+jmp pwlr_next
+
+pwlr_abs:
+cmp rdi, 2                         ; only an equ constant is position-free
+jne pwlr_keep
+mov rcx, [rsi+24]                  ; the constant's value
+mov rdx, [rax+24]                  ; patch section
+push rax
+push r8
+push r9
+push r10
+mov r11, rdx
+mov rdi, [rax+0]
+push rcx
+call par_local_site
+pop rcx
+mov [rdi+0], rcx
+pop r10
+pop r9
+pop r8
+pop rax
+jmp pwlr_next
+
+pwlr_keep:
+; retain this fixup, sliding it down over any already-resolved entries
+cmp r9, r10
+je pwlr_keep_bump
+mov rcx, r10
+shl rcx, 5
+mov rdx, rbx
+add rdx, FIXUPS_OFF
+add rcx, rdx                       ; destination record
+mov rdx, [rax+0]
+mov [rcx+0], rdx
+mov rdx, [rax+8]
+mov [rcx+8], rdx
+mov rdx, [rax+16]
+mov [rcx+16], rdx
+mov rdx, [rax+24]
+mov [rcx+24], rdx
+pwlr_keep_bump:
+add r10, 1
+pwlr_next:
+add r9, 1
+jmp pwlr_loop
+pwlr_done:
+mov rax, rbx
+add rax, FIXUPS_META_OFF
+mov [rax+0], r10                   ; only the deferred ones remain
+ret
+
+; par_local_site -- rdi = section-relative offset, r11 = section.
+;   out: rdi = address of that offset in THIS worker's own buffers
+par_local_site:
+cmp r11, SEC_TEXT
+jne par_local_site_data
+add rdi, r14                       ; text offsets already carry HDR_LEN
+ret
+par_local_site_data:
+mov rax, rbx
+add rax, DATABUF_OFF
+add rdi, rax
+ret
+
+par_worker_emit:
+call par_worker_local_resolve
+; finalize whichever section cursor is live (mirrors resolve_fixups)
+mov rax, rbx
+add rax, CUR_SECTION_OFF
+mov rcx, [rax+0]
+cmp rcx, SEC_TEXT
+je par_we_save_text
+mov rax, rbx
+add rax, SAVED_DATA_R15_OFF
+mov [rax+0], r15
+jmp par_we_slot
+par_we_save_text:
+mov rax, rbx
+add rax, SAVED_TEXT_R15_OFF
+mov [rax+0], r15
+par_we_slot:
+mov rax, rbx
+add rax, MYJOB_OFF
+mov rax, [rax+0]
+mov rdx, SLOT_SIZE
+imul rax, rdx
+mov rcx, rbx
+add rcx, SHARED_OFF
+mov rcx, [rcx+0]
+add rax, rcx
+push rax                           ; [rsp] = slot base, held throughout
+
+; --- text bytes ---
+mov rax, rbx
+add rax, SAVED_TEXT_R15_OFF
+mov rax, [rax+0]
+mov rcx, r14
+add rcx, HDR_LEN
+sub rax, rcx                       ; text_size
+cmp rax, SLOT_TEXT_CAP
+jae par_we_toobig
+mov rdi, [rsp+0]
+mov rcx, rdi
+add rcx, SM_TEXTSZ
+mov [rcx+0], rax
+push rax
+add rdi, SLOT_TEXT_OFF
+mov rsi, r14
+add rsi, HDR_LEN
+pop rcx
+push rcx
+call mem_copy
+pop rax
+
+; --- data bytes ---
+mov rax, rbx
+add rax, SAVED_DATA_R15_OFF
+mov rax, [rax+0]
+mov rcx, rbx
+add rcx, DATABUF_OFF
+sub rax, rcx                       ; data_size
+cmp rax, SLOT_DATA_CAP
+jae par_we_toobig
+mov rdi, [rsp+0]
+mov rcx, rdi
+add rcx, SM_DATASZ
+mov [rcx+0], rax
+add rdi, SLOT_DATA_OFF
+mov rsi, rbx
+add rsi, DATABUF_OFF
+mov rcx, rax
+call mem_copy
+
+; --- defined labels ---
+mov rax, rbx
+add rax, DEFLIST_META_OFF
+mov r8, [rax+0]                    ; count
+mov rax, [rsp+0]
+mov rcx, rax
+add rcx, SM_NSYM
+mov [rcx+0], r8
+mov r9, 0
+par_we_sym_loop:
+cmp r9, r8
+jae par_we_sym_done
+mov rax, r9
+shl rax, 3
+mov rcx, rbx
+add rcx, DEFLIST_OFF
+add rax, rcx
+mov rsi, [rax+0]                   ; symbol slot address
+mov rax, r9
+shl rax, 6                         ; * SSYM_ENT (64)
+mov rdi, [rsp+0]
+add rdi, SLOT_SYM_OFF
+add rdi, rax
+mov rcx, [rsi+8]                   ; name_ptr
+mov [rdi+0], rcx
+mov rcx, [rsi+16]                  ; name_len
+mov [rdi+8], rcx
+mov rcx, [rsi+24]                  ; value (section-relative)
+mov [rdi+16], rcx
+mov rcx, [rsi+40]                  ; section
+mov [rdi+24], rcx
+mov rcx, [rsi+0]                   ; the name's hash, already computed
+mov [rdi+32], rcx
+add r9, 1
+jmp par_we_sym_loop
+par_we_sym_done:
+
+; --- fixups, carried by NAME: a worker's symbol-slot addresses mean
+; nothing to the parent, but the name bytes live in the input buffer,
+; which is identical in every process ---
+mov rax, rbx
+add rax, FIXUPS_META_OFF
+mov r8, [rax+0]
+mov rax, [rsp+0]
+mov rcx, rax
+add rcx, SM_NFIX
+mov [rcx+0], r8
+mov r9, 0
+par_we_fix_loop:
+cmp r9, r8
+jae par_we_fix_done
+mov rax, r9
+shl rax, 5                         ; * FIX_ENT (32)
+mov rcx, rbx
+add rcx, FIXUPS_OFF
+add rax, rcx                       ; rax = fixup record
+mov rdx, r9                        ; *48 as (x<<5)+(x<<4): this dialect has
+shl rdx, 5                         ; only two-operand imul, and the
+mov rsi, r9                        ; three-operand form silently assembles
+shl rsi, 4                         ; as `imul rdx, rdx` with the constant
+add rdx, rsi                       ; dropped -- a wrong stride, not an error
+mov rdi, [rsp+0]
+add rdi, SLOT_FIX_OFF
+add rdi, rdx                       ; rdi = shared entry
+mov rcx, [rax+0]
+mov [rdi+0], rcx                   ; patch_off
+mov rcx, [rax+24]
+mov [rdi+8], rcx                   ; patch section
+mov rcx, [rax+16]
+mov [rdi+16], rcx                  ; kind
+mov rsi, [rax+8]                   ; symbol slot
+mov rcx, [rsi+8]
+mov [rdi+24], rcx                  ; target name_ptr
+mov rcx, [rsi+16]
+mov [rdi+32], rcx                  ; target name_len
+mov rcx, [rsi+0]
+mov [rdi+40], rcx                  ; target name hash
+add r9, 1
+jmp par_we_fix_loop
+par_we_fix_done:
+pop rax
+mov rdi, 0
+mov rax, SYS_exit
+syscall
+
+par_we_toobig:
+mov rdi, msg_chunk_too_big
+call write_cstr_fd2
+mov rdi, 1
+mov rax, SYS_exit
+syscall
+
+; ===========================================================================
+; par_merge -- stitch the workers' slots into the parent's own buffers.
+; Two passes, because a fixup in chunk 0 may target a label defined in
+; chunk 5: pass 1 lays down the bytes and installs every label at its
+; final address, pass 2 resolves every fixup against the completed table.
+; Chunks are walked in index order, never completion order, so the output
+; is identical no matter how the scheduler happened to run the workers.
+; ===========================================================================
+par_merge:
+; Do the workers between them still have anything unresolved? If not,
+; every reference in the file was settled inside the chunk that made it,
+; and the merge can skip building a symbol table altogether -- which for
+; ordinary code (jumps and calls land near their target) is the common
+; case and the difference between parallel being a win and a loss.
+mov rax, rbx
+add rax, JOBS_OFF
+mov r8, [rax+0]
+mov r9, 0
+mov r11, 0
+par_merge_count:
+cmp r9, r8
+jae par_merge_counted
+mov rax, r9
+mov rdx, SLOT_SIZE
+imul rax, rdx
+mov rcx, rbx
+add rcx, SHARED_OFF
+mov rcx, [rcx+0]
+add rax, rcx
+add rax, SM_NFIX
+mov rax, [rax+0]
+add r11, rax
+add r9, 1
+jmp par_merge_count
+par_merge_counted:
+mov rax, rbx
+add rax, PAR_NEEDSYM_OFF
+mov [rax+0], r11
+cmp r11, 0
+je par_merge_filter_done
+
+; Mark, in the filter, the low hash bits of every name a deferred fixup
+; is looking for. The symbol-install loop then skips any label whose hash
+; misses -- and with references overwhelmingly local, that is nearly all
+; of them. False positives only cost a needless insert.
+mov r9, 0
+par_merge_filter_chunk:
+cmp r9, r8
+jae par_merge_filter_done
+mov rax, r9
+mov rdx, SLOT_SIZE
+imul rax, rdx
+mov rcx, rbx
+add rcx, SHARED_OFF
+mov rcx, [rcx+0]
+add rax, rcx
+push rax
+mov rcx, rax
+add rcx, SM_NFIX
+mov r10, [rcx+0]
+mov r11, 0
+par_merge_filter_fix:
+cmp r11, r10
+jae par_merge_filter_next
+mov rax, r11
+shl rax, 5
+mov rcx, r11
+shl rcx, 4
+add rax, rcx                       ; * SFIX_ENT (48)
+mov rcx, [rsp+0]
+add rcx, SLOT_FIX_OFF
+add rax, rcx
+mov rcx, [rax+40]                  ; target hash
+and rcx, PAR_FILTER_MASK
+mov rdx, rbx
+add rdx, PAR_FILTER_OFF
+add rdx, rcx
+mov rcx, 1
+movb [rdx+0], rcx
+add r11, 1
+jmp par_merge_filter_fix
+par_merge_filter_next:
+pop rax
+add r9, 1
+jmp par_merge_filter_chunk
+par_merge_filter_done:
+
+mov rax, rbx
+add rax, JOBS_OFF
+mov r8, [rax+0]
+mov r9, 0
+push r8
+mov rax, 0
+push rax                           ; [rsp]   = running text base
+push rax                           ; [rsp+8] would collide; see below
+; stack: [rsp]=data_base, [rsp+8]=text_base, [rsp+16]=jobs
+par_merge_p1:
+mov rcx, [rsp+16]
+cmp r9, rcx
+jae par_merge_p2_init
+mov rax, r9
+mov rdx, SLOT_SIZE
+imul rax, rdx
+mov rcx, rbx
+add rcx, SHARED_OFF
+mov rcx, [rcx+0]
+add rax, rcx
+push rax                           ; [rsp] = slot
+
+; record this chunk's bases, then copy its bytes into place
+mov rax, r9
+shl rax, 6
+mov rcx, rbx
+add rcx, CHUNKTAB_OFF
+add rax, rcx
+mov rcx, [rsp+16]                  ; text_base
+mov [rax+32], rcx
+mov rcx, [rsp+8]                   ; data_base
+mov [rax+40], rcx
+
+mov rax, [rsp+0]
+mov rcx, rax
+add rcx, SM_TEXTSZ
+mov rcx, [rcx+0]                   ; text size
+push rcx
+mov rdi, r14
+add rdi, HDR_LEN
+mov rdx, [rsp+24]                  ; text_base
+add rdi, rdx
+mov rsi, [rsp+8]
+add rsi, SLOT_TEXT_OFF
+pop rcx
+push rcx
+call mem_copy
+pop rcx
+mov rax, [rsp+16]
+add rax, rcx
+mov [rsp+16], rax                  ; text_base += text size
+
+mov rax, [rsp+0]
+mov rcx, rax
+add rcx, SM_DATASZ
+mov rcx, [rcx+0]
+push rcx
+mov rdi, rbx
+add rdi, DATABUF_OFF
+mov rdx, [rsp+16]                  ; data_base
+add rdi, rdx
+mov rsi, [rsp+8]
+add rsi, SLOT_DATA_OFF
+pop rcx
+push rcx
+call mem_copy
+pop rcx
+mov rax, [rsp+8]
+add rax, rcx
+mov [rsp+8], rax                   ; data_base += data size
+
+; install this chunk's labels at their final addresses -- but only if
+; something actually still needs looking up
+mov rax, rbx
+add rax, PAR_NEEDSYM_OFF
+mov rax, [rax+0]
+cmp rax, 0
+je par_merge_sym_done
+mov rax, [rsp+0]
+mov rcx, rax
+add rcx, SM_NSYM
+mov r10, [rcx+0]
+mov r11, 0
+par_merge_sym:
+cmp r11, r10
+jae par_merge_sym_done
+mov rax, r11
+shl rax, 6                         ; * SSYM_ENT (64)
+mov rcx, [rsp+0]
+add rcx, SLOT_SYM_OFF
+add rax, rcx                       ; rax = serialized symbol
+; skip labels nothing is waiting on -- one byte read instead of a hash
+; and an insert into a 16 MiB table
+mov rcx, [rax+32]                  ; this label's hash
+and rcx, PAR_FILTER_MASK
+mov rdx, rbx
+add rdx, PAR_FILTER_OFF
+add rdx, rcx
+movb rdx, [rdx+0]
+cmp rdx, 0
+je par_merge_sym_skip
+mov rsi, [rax+0]                   ; name_ptr
+mov rcx, [rax+8]                   ; name_len
+mov rdx, [rax+16]                  ; local value
+mov rdi, [rax+24]                  ; section
+push r9                            ; r9 is the chunk index; find_or_create_
+push r10                           ; symbol clobbers r8/r9/r10/r11 through
+push r11                           ; fnv1a and its probe loop
+push rdx
+push rdi
+call find_or_create_symbol         ; rsi/rcx -> rax = slot
+pop rdi
+pop rdx
+pop r11
+pop r10
+pop r9
+push r10
+push r11
+mov rcx, [rax+32]
+cmp rcx, 0
+jne par_merge_dup
+; final value = local + this chunk's base for its section
+mov rcx, r9
+shl rcx, 6
+mov rsi, rbx
+add rsi, CHUNKTAB_OFF
+add rcx, rsi
+cmp rdi, SEC_TEXT
+jne par_merge_sym_data
+mov rsi, [rcx+32]
+jmp par_merge_sym_have
+par_merge_sym_data:
+mov rsi, [rcx+40]
+par_merge_sym_have:
+add rdx, rsi
+mov [rax+24], rdx
+mov [rax+40], rdi
+mov rdx, 1
+mov [rax+32], rdx
+pop r11
+pop r10
+par_merge_sym_skip:
+add r11, 1
+jmp par_merge_sym
+par_merge_sym_done:
+pop rax                            ; drop slot
+add r9, 1
+jmp par_merge_p1
+
+par_merge_dup:
+mov rdi, msg_dup
+call write_cstr_fd2
+mov rdi, msg_nl
+call write_cstr_fd2
+mov rdi, 1
+mov rax, SYS_exit
+syscall
+
+par_merge_p2_init:
+; both section cursors are final now: publish them so the shared output
+; stage sees exactly what the serial path would have left behind
+mov rax, r14
+add rax, HDR_LEN
+mov rcx, [rsp+8]
+add rax, rcx
+mov rcx, rbx
+add rcx, SAVED_TEXT_R15_OFF
+mov [rcx+0], rax
+mov rax, rbx
+add rax, DATABUF_OFF
+mov rcx, [rsp+0]
+add rax, rcx
+mov rcx, rbx
+add rcx, SAVED_DATA_R15_OFF
+mov [rcx+0], rax
+
+; DATA_FILE_START must exist before any fixup is resolved -- par_patch
+; needs it to turn a data offset into a file offset. Same page-rounding
+; the serial path does in resolve_fixups.
+mov rax, r14
+add rax, HDR_LEN
+mov rcx, [rsp+8]
+add rax, rcx
+sub rax, r14                       ; header + total text
+add rax, 4095
+mov rcx, PAGE_MASK
+and rax, rcx
+mov rcx, rbx
+add rcx, DATA_FILE_START_OFF
+mov [rcx+0], rax
+
+mov r9, 0
+par_merge_p2:
+mov rcx, [rsp+16]
+cmp r9, rcx
+jae par_merge_fin
+mov rax, r9
+mov rdx, SLOT_SIZE
+imul rax, rdx
+mov rcx, rbx
+add rcx, SHARED_OFF
+mov rcx, [rcx+0]
+add rax, rcx
+push rax                           ; [rsp] = slot
+mov rcx, rax
+add rcx, SM_NFIX
+mov r10, [rcx+0]
+mov r11, 0
+par_merge_fix:
+cmp r11, r10
+jae par_merge_fix_done
+mov rax, r11                       ; *48 = (x<<5)+(x<<4), see par_we_fix_loop
+shl rax, 5
+mov rcx, r11
+shl rcx, 4
+add rax, rcx
+mov rcx, [rsp+0]
+add rcx, SLOT_FIX_OFF
+add rax, rcx                       ; rax = serialized fixup
+push r9                            ; chunk index -- see the pass-1 note
+push r10
+push r11
+push rax
+mov rsi, [rax+24]                  ; target name_ptr
+mov rcx, [rax+32]                  ; target name_len
+call find_or_create_symbol
+mov rdi, rax                       ; symbol slot
+pop rax
+pop r11
+pop r10
+pop r9
+push r10
+push r11
+mov rcx, [rdi+32]
+cmp rcx, 0
+je par_merge_undef
+mov rdx, [rdi+24]                  ; target final value
+mov rsi, [rdi+40]                  ; target section
+mov r8, [rdi+32]                   ; status (2 = const: no load bias)
+; absolute patch position = patch_off + this chunk's base for its section
+mov rcx, [rax+0]                   ; patch_off
+mov rdi, [rax+8]                   ; patch section
+mov r11, [rax+16]                  ; kind
+push rsi
+push rdx
+push r8
+mov rax, r9
+shl rax, 6
+mov rsi, rbx
+add rsi, CHUNKTAB_OFF
+add rax, rsi
+cmp rdi, SEC_TEXT
+jne par_merge_fix_pdata
+mov rsi, [rax+32]
+jmp par_merge_fix_phave
+par_merge_fix_pdata:
+mov rsi, [rax+40]
+par_merge_fix_phave:
+add rcx, rsi                       ; rcx = final patch offset in its section
+pop r8
+pop rdx
+pop rsi
+call par_patch                     ; rcx=patch_off rdi=patch_sec rdx=target
+                                    ; rsi=target_sec r11=kind r8=status
+pop r11
+pop r10
+add r11, 1
+jmp par_merge_fix
+par_merge_fix_done:
+pop rax
+add r9, 1
+jmp par_merge_p2
+
+par_merge_undef:
+mov rdi, msg_undef
+call write_cstr_fd2
+mov rdi, msg_nl
+call write_cstr_fd2
+mov rdi, 1
+mov rax, SYS_exit
+syscall
+
+par_merge_fin:
+pop rax
+pop rax
+pop rax
+ret
+
+; ===========================================================================
+; par_patch -- write one resolved fixup into the merged image.
+;   rcx = final patch offset (within rdi's section)
+;   rdi = section the patch lives in
+;   rdx = target's final value, rsi = target's section
+;   r11 = kind, r8 = target status (2 = equ constant)
+; Mirrors resolve_fixups' arithmetic exactly; the two must agree or the
+; parallel and serial outputs would differ.
+; ===========================================================================
+par_patch:
+push r9
+push r10
+push r11
+; --- file offset of the target ---
+; a text offset is already a file offset (header+text start the file);
+; a data offset needs DATA_FILE_START added, exactly as resolve_fixups does
+mov rax, rdx
+cmp rsi, SEC_TEXT
+je par_patch_tgt_text
+mov r10, rbx
+add r10, DATA_FILE_START_OFF
+mov r10, [r10+0]
+add rax, r10
+par_patch_tgt_text:
+mov r9, rax                        ; r9 = target file offset
+
+; --- address to write, and file offset of, the patch site ---
+mov rax, rcx
+cmp rdi, SEC_TEXT
+je par_patch_site_text
+mov r10, rbx
+add r10, DATA_FILE_START_OFF
+mov r10, [r10+0]
+add rax, r10                       ; site file offset
+mov rdi, rbx
+add rdi, DATABUF_OFF
+add rdi, rcx                       ; site address (data buffer)
+jmp par_patch_have_site
+par_patch_site_text:
+mov rdi, r14
+add rdi, rcx                       ; site address (text buffer; rcx already
+                                    ; carries the HDR_LEN bias)
+par_patch_have_site:
+mov r10, rax                       ; r10 = site file offset
+
+cmp r11, FIX_ABS64
+je par_patch_abs
+sub r9, r10
+sub r9, 4                          ; rel32 = target - (site + 4)
+mov rax, r9
+call store_dword                   ; rdi = site address
+pop r11
+pop r10
+pop r9
+ret
+
+par_patch_abs:
+cmp r8, 2                          ; equ constant: a plain value, never an
+je par_patch_abs_nobias            ; address, so no load bias
+add r9, LOAD_BASE
+par_patch_abs_nobias:
+mov [rdi+0], r9
+pop r11
+pop r10
+pop r9
 ret
 
 ; ===========================================================================
@@ -3245,6 +4727,9 @@ jmp die
 die_open:
 mov rdi, msg_open
 jmp die
+die_fork:
+mov rdi, msg_fork
+jmp die
 die_read:
 mov rdi, msg_read
 jmp die
@@ -3400,6 +4885,10 @@ msg_open:
 db "v1: could not open input or output file"
 db 10
 db 0
+msg_fork:
+db "v1: fork failed"
+db 10
+db 0
 msg_read:
 db "v1: read failed"
 db 10
@@ -3432,6 +4921,10 @@ db "v1: too many fixups"
 db 0
 msg_immrange:
 db "v1: immediate out of range"
+db 0
+msg_chunk_too_big:
+db "v1: parallel chunk exceeded its slot; retry with fewer jobs"
+db 10
 db 0
 msg_disprange:
 db "v1: displacement out of range"

@@ -38,6 +38,16 @@ run_prog sections 0
 echo "=== range / overflow regressions ==="
 ./tests/regress_range.sh "$V"
 
+echo "=== parallel == serial (byte-for-byte, every worker count) ==="
+./tests/par_equiv.sh "$V" | tail -3
+./tests/par_equiv.sh "$V" >/dev/null 2>&1 || fail=1
+
+echo "=== parallel determinism ==="
+./tests/determinism.sh "$V" v1.v0 8 4
+
+echo "=== cross-chunk references ==="
+./tests/repro_cross.sh "$V" 400
+
 echo "=== self-hosting fixed point ==="
 ./tests/fixedpoint.sh "$V" || fail=1
 

@@ -81,6 +81,47 @@ narrower than 64 bits (memory access has `movb`/`movw`/`movd`; the ALU
 ops don't), scaled-index or RIP-relative addressing, short (`rel8`) jump
 encoding.
 
+## Parallel assembly
+
+`v1` can assemble one file across multiple cores. Pass a worker count as
+the third argument:
+
+```
+./v1 big.v0 big.out 8
+```
+
+The output is **byte-identical no matter how many workers are used** —
+`tests/par_equiv.sh` asserts exactly that for every test input at every
+worker count, and it is the reason the feature is trustworthy at all.
+
+Each worker is a `fork`ed process, so it gets a copy-on-write clone of
+the address space and runs the ordinary, unmodified assembler over its
+own slice of the source. Nothing is shared and nothing is locked — the
+only shared memory is one result slot per worker, which only that worker
+writes and which the parent reads only after `wait4` says the worker is
+gone. Chunks are merged in index order, never completion order, so
+scheduling cannot affect the result.
+
+Measured on a 16-thread i5-13400F, best of 7, output to `/dev/null`:
+
+| Input | `-j1` | `-j16` | Speedup |
+|---|---|---|---|
+| 100k lines (1.3 MB) | 18.7 ms | 7.1 ms | **2.63×** |
+| 1M lines (13 MB) | 78.8 ms | 34.3 ms | **2.29×** |
+
+That is ~180 MB/s and ~380 MB/s of source respectively. Files under
+256 KB ignore the worker count and run serially — below that size,
+forking and merging cost more than they save.
+
+The ceiling is Amdahl, not contention: a serial pre-pass has to run
+first (it finds chunk boundaries, and resolves the two things that
+genuinely flow forward through a file — the current section and the `equ`
+constants), and a serial merge has to stitch the pieces back together.
+Two optimisations do most of the work of keeping those cheap: workers
+resolve every reference that lands inside their own chunk (nearly all
+jumps and calls), and the merge installs only those labels some deferred
+reference actually asks for, filtered by a hash lookup.
+
 ## Performance
 
 Symbol lookup is an FNV-1a open-addressed hash table (was a linear scan

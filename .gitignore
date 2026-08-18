@@ -7,3 +7,6 @@ v1_next
 v1_gen*
 *.out
 *.bin
+
+# editor/tooling state, not project content
+.serena/
