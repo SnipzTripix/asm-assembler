@@ -47,7 +47,9 @@
 ;   dw dd dq 2/4/8-byte values; dq also takes a label, which is what
 ;            makes a jump table expressible
 ;   resb     reserve N bytes, .bss only
-;   equ      compile-time constant; may be referenced before its
+;   equ      compile-time constant; the value may be a number (with an
+;            optional '-') or the name of a constant already defined,
+;            so `B equ A` aliases. May be referenced before its
 ;            definition by `mov reg, NAME`, but not by an arithmetic
 ;            operand, which resolves constants immediately
 ;   labels, and memory operands [base+disp] and [base+index*scale+disp]
@@ -63,10 +65,16 @@
 ; Range checking: values that cannot fit the field they are headed for
 ; are hard errors ("immediate out of range", "displacement out of
 ; range"), never silently truncated -- the imm32 of an 81 /digit
-; arithmetic form, the disp32 of a memory operand, and the 64-bit
-; accumulator in parse_imm are all checked. This matters more than it
-; sounds: every one of those silently produced a wrong encoding at some
-; point, which is the single worst failure mode an assembler has.
+; arithmetic form, the disp32 of a memory operand, the 64-bit
+; accumulator in parse_imm, the imm8 shift count, and the operand of
+; db/dw/dd are all checked. This matters more than it sounds: every one
+; of those silently produced a wrong encoding at some point, which is the
+; single worst failure mode an assembler has.
+;
+; One statement per line, and the line must end where the statement does.
+; There are no expressions and no comma-separated operand lists, so
+; `mov rdi, 4+2`, `db 1, 2, 3` and `add rax, rbx, rcx` are errors rather
+; than the first half of themselves quietly assembled -- see expect_eol.
 ;
 ; NOT implemented, i.e. what "grow the dialect further" still means here:
 ; arithmetic at widths other than 64-bit (movb/movw/movd cover memory
@@ -185,6 +193,8 @@ SYMMASK_OFF     equ 0xE110000            ; runtime symbol-table mask. The
 PAR_CONST_META_OFF equ 0xE110008         ; count of prescan-harvested equ
 PAR_CONST_OFF   equ 0xE120000            ; {name_ptr, name_len, value, pad}
 PAR_CONST_ENT   equ 32
+PAR_CONST_SHIFT equ 5                    ; log2(PAR_CONST_ENT); indexing goes
+                                         ; through it so the two cannot drift
 PAR_CONST_CAP   equ 32768
 DEFLIST_OFF     equ 0xD900000            ; 8 MiB of symbol-slot pointers, one
                                           ; per label THIS process defined --
@@ -1007,6 +1017,37 @@ skip_to_eol_ret:
 ret
 
 ; ===========================================================================
+; expect_eol -- a statement is finished; require that the line is too.
+;
+; Every do_*_tail used to end with skip_ws + skip_to_eol, which threw away
+; whatever was left on the line without looking at it. That made a whole
+; class of malformed input assemble quietly into a shorter program than
+; the source describes: `mov rax, rbx rcx` dropped the third word,
+; `add rax, rbx, rcx` dropped the second source, `db 1, 2, 3` emitted one
+; byte, and `mov rdi, 4+2` emitted 4 -- the "+2" was simply skipped, so a
+; reader who assumed expression support got a plausible binary with the
+; wrong constant in it. None of these is a diagnosable error at the point
+; the operands parse; the evidence is entirely in what comes after.
+;
+; Anything other than end-of-input, a newline or a comment is now an
+; error. Once the line is known to be over, skip_to_eol does the rest
+; (consuming the comment text, and bumping the line counter).
+; ===========================================================================
+expect_eol:
+call skip_ws
+cmp r13, r12
+jae expect_eol_ok                  ; end of input ends the statement too
+movb rax, [r13+0]
+cmp rax, CH_NL
+je expect_eol_ok
+cmp rax, CH_SEMI
+je expect_eol_ok
+jmp die_bad_operand
+expect_eol_ok:
+call skip_to_eol
+ret
+
+; ===========================================================================
 ; scan_ident -- scan [A-Za-z0-9_]+ at r13
 ;   out: rsi = start, rcx = length; r13 advanced past it
 ; ===========================================================================
@@ -1267,6 +1308,69 @@ mov rcx, 0x1FFFFFFFF
 cmp rax, rcx
 jne die_disp_range
 check_disp32_ok:
+pop rax
+ret
+
+; ===========================================================================
+; check_imm8 / check_imm16 / check_imm32u -- in: rax = value. Dies unless
+; it fits the data directive's slot. db/dw/dd wrote their operand with a
+; movb / two movb / store_dword and never looked at the bits above, so
+; `db 300` emitted 44 and `dd 0x1234567890` emitted 0x34567890 -- exactly
+; the silent truncation the file's own comment above do_dw claims cannot
+; happen here.
+;
+; Unlike check_imm32 (which backs an instruction field the CPU
+; sign-extends, so only the signed range is meaningful), a data slot is
+; just bytes: both 0..2^n-1 and -2^(n-1)..-1 name a bit pattern that fits,
+; and `db 0xFF` and `db -1` should both be legal and identical. So the
+; unsigned range is tested first, and only a value outside it has to look
+; like a negative of the right width.
+; ===========================================================================
+check_imm8:
+push rax
+push rcx
+mov rcx, rax
+shr rcx, 8
+cmp rcx, 0
+je check_imm8_ok
+shr rax, 7
+mov rcx, 0x1FFFFFFFFFFFFFF          ; 2^57-1: sign bit and all above it set
+cmp rax, rcx
+jne die_imm_range
+check_imm8_ok:
+pop rcx
+pop rax
+ret
+
+check_imm16:
+push rax
+push rcx
+mov rcx, rax
+shr rcx, 16
+cmp rcx, 0
+je check_imm16_ok
+shr rax, 15
+mov rcx, 0x1FFFFFFFFFFFF            ; 2^49-1
+cmp rax, rcx
+jne die_imm_range
+check_imm16_ok:
+pop rcx
+pop rax
+ret
+
+check_imm32u:
+push rax
+push rcx
+mov rcx, rax
+shr rcx, 32
+cmp rcx, 0
+je check_imm32u_ok
+shr rax, 31
+mov rcx, 0x1FFFFFFFF                ; 2^33-1
+cmp rax, rcx
+jne die_imm_range
+check_imm32u_ok:
+pop rcx
 pop rax
 ret
 
@@ -2173,6 +2277,76 @@ ret
 ; one). Constant counts are tiny, so doing this N+1 times costs nothing
 ; next to the page faults it avoids.
 ; ===========================================================================
+; ===========================================================================
+; par_resolve_equ_value -- the prescan's stand-in for resolve_imm_operand.
+;
+; It cannot call try_resolve_const: the prescan deliberately keeps its
+; constants OUT of the hash table (see par_prescan_isequ), so an alias
+; like `A equ 4` / `B equ A` would resolve to 4 on the serial path and to
+; nothing here -- and "the output depends on the worker count" is the one
+; failure this design is not allowed to have. So the alias is resolved
+; against what the prescan has recorded so far, which is the same set, in
+; the same file order, that the serial path would have had in its table.
+; Linear because aliases are rare and only a non-numeric value pays for
+; it; the numeric case never touches the loop.
+;   in: r13 at the value.  out: rax = value, r13 advanced
+;   clob: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11
+; ===========================================================================
+par_resolve_equ_value:
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_MINUS
+je par_req_num
+cmp rax, CH_0
+jl par_req_name
+cmp rax, CH_9PLUS1
+jae par_req_name
+par_req_num:
+call parse_signed_imm
+ret
+
+par_req_name:
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+mov r10, rsi                       ; the name has to outlive every call
+mov r11, rcx                       ; below; bytes_eq preserves r8-r11
+mov rax, rbx
+add rax, PAR_CONST_META_OFF
+mov r8, [rax+0]                    ; constants recorded so far
+mov r9, 0
+par_req_probe:
+cmp r9, r8
+jae par_req_undef
+mov rax, r9
+shl rax, PAR_CONST_SHIFT
+mov rcx, rbx
+add rcx, PAR_CONST_OFF
+add rax, rcx
+mov rdi, [rax+0]                   ; name_ptr
+mov rdx, [rax+8]                   ; name_len
+mov rsi, r10
+mov rcx, r11
+call bytes_eq
+cmp rax, 1
+jne par_req_next
+mov rax, r9                        ; recompute rather than stash: bytes_eq
+shl rax, PAR_CONST_SHIFT           ; clobbers rax, and r8/r9 are the only
+mov rcx, rbx                       ; registers it promises to give back
+add rcx, PAR_CONST_OFF
+add rax, rcx
+mov rax, [rax+16]                  ; value
+ret
+par_req_next:
+add r9, 1
+jmp par_req_probe
+par_req_undef:
+mov rsi, r10
+mov rcx, r11
+jmp die_undef_named
+
+; ===========================================================================
 par_install_consts:
 mov rax, rbx
 add rax, PAR_CONST_META_OFF
@@ -2182,7 +2356,7 @@ pic_loop:
 cmp r9, r8
 jae pic_done
 mov rax, r9
-shl rax, 5                         ; * PAR_CONST_ENT
+shl rax, PAR_CONST_SHIFT           ; * PAR_CONST_ENT
 mov rcx, rbx
 add rcx, PAR_CONST_OFF
 add rax, rcx
@@ -2383,7 +2557,7 @@ push r10
 push rsi
 push rcx
 call skip_ws
-call parse_imm
+call par_resolve_equ_value
 mov rdi, rax                       ; value
 pop rcx
 pop rsi
@@ -2393,7 +2567,7 @@ mov rdx, [rax+0]
 cmp rdx, PAR_CONST_CAP
 jae die_toomany_syms
 mov r8, rdx
-shl r8, 5                          ; * PAR_CONST_ENT (32)
+shl r8, PAR_CONST_SHIFT            ; * PAR_CONST_ENT
 mov r9, rbx
 add r9, PAR_CONST_OFF
 add r8, r9
@@ -4009,8 +4183,7 @@ mov r10, 0x89
 call emit_mem
 
 do_mov_tail:
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4114,8 +4287,7 @@ mov r10, r11                       ; emit_rr takes the opcode in r10
 call emit_rr
 
 do_arith_tail:
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4126,20 +4298,27 @@ resolve_imm_operand:
 cmp r13, r12
 jae die_bad_operand
 movb rax, [r13+0]
+cmp rax, CH_MINUS                  ; '-' sorts below '0', so the const path
+je resolve_imm_operand_num         ; would have scanned it as an identifier
 cmp rax, CH_0
 jl resolve_imm_operand_const
 cmp rax, CH_9PLUS1
 jae resolve_imm_operand_const
-call parse_imm
+resolve_imm_operand_num:
+call parse_signed_imm
 ret
 resolve_imm_operand_const:
 call scan_ident
 cmp rcx, 0
 je die_bad_operand
-call try_resolve_const
+push rsi                           ; try_resolve_const's probe runs through
+push rcx                           ; bytes_eq and makes no promise about
+call try_resolve_const             ; rsi/rcx; the name has to survive so the
+pop rcx                            ; error can name it
+pop rsi
 cmp rdx, 0
-je die_bad_operand
-ret
+je die_undef_named                 ; "undefined label: FOO" beats "bad
+ret                                ; operand" -- the operand parsed fine
 
 ; ===========================================================================
 ; shl/shr reg, imm8-or-const -- variable-count (shift by cl) not implemented
@@ -4159,12 +4338,13 @@ jne die_bad_operand
 add r13, 1
 call skip_ws
 call resolve_imm_operand
-mov r11, rax
+cmp rax, 64                        ; emit_shift_imm stores the count with a
+jae die_imm_range                  ; single movb, so `shl rax, 300` used to
+mov r11, rax                       ; encode 300 & 0xFF = 44 and shift by 44
 pop rax
 mov r10, 4
 call emit_shift_imm
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 do_shr:
@@ -4182,12 +4362,13 @@ jne die_bad_operand
 add r13, 1
 call skip_ws
 call resolve_imm_operand
-mov r11, rax
+cmp rax, 64                        ; emit_shift_imm stores the count with a
+jae die_imm_range                  ; single movb, so `shl rax, 300` used to
+mov r11, rax                       ; encode 300 & 0xFF = 44 and shift by 44
 pop rax
 mov r10, 5
 call emit_shift_imm
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4215,8 +4396,7 @@ mov rdx, rax
 pop rax
 mov r10, 0x8D
 call emit_mem
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4304,8 +4484,7 @@ mov rdx, rax
 pop rax
 call emit_imul
 do_imul_tail:
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4404,8 +4583,7 @@ pop rax
 mov r10, 0x85
 call emit_rr
 do_test_tail:
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4448,8 +4626,7 @@ call parse_reg
 cmp rax, NEG_ONE
 je die_bad_operand
 call emit_neg
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4546,8 +4723,7 @@ do_movsz_store_w:
 call emit_movw_store
 jmp do_movsz_tail
 do_movsz_tail:
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4574,8 +4750,7 @@ add rcx, 0x50
 movb [r15+0], rcx
 add r15, 1
 do_push_done:
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 do_pop:
@@ -4599,8 +4774,7 @@ add rcx, 0x58
 movb [r15+0], rcx
 add r15, 1
 do_pop_done:
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4612,8 +4786,7 @@ mov rax, 0xE9
 movb [r15+0], rax
 add r15, 1
 call emit_rel32_ref
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; call takes either a label (E8 rel32) or a register (FF /2), the latter
@@ -4652,8 +4825,7 @@ movb [r15+1], rdx
 add r15, 2
 
 do_call_tail:
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 do_je:
@@ -4664,8 +4836,7 @@ mov rax, 0x84
 movb [r15+1], rax
 add r15, 2
 call emit_rel32_ref
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 do_jne:
@@ -4676,8 +4847,7 @@ mov rax, 0x85
 movb [r15+1], rax
 add r15, 2
 call emit_rel32_ref
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 do_jl:
@@ -4688,8 +4858,7 @@ mov rax, 0x8C
 movb [r15+1], rax
 add r15, 2
 call emit_rel32_ref
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 do_jae:
@@ -4700,8 +4869,7 @@ mov rax, 0x83
 movb [r15+1], rax
 add r15, 2
 call emit_rel32_ref
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4713,16 +4881,14 @@ movb [r15+0], rax
 mov rax, 5
 movb [r15+1], rax
 add r15, 2
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 do_ret:
 mov rax, 0xC3
 movb [r15+0], rax
 add r15, 1
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4737,6 +4903,7 @@ cmp rax, CH_QUOTE
 je do_db_string
 
 call resolve_imm_operand
+call check_imm8
 movb [r15+0], rax
 add r15, 1
 jmp do_db_tail
@@ -4803,8 +4970,7 @@ jmp do_db_copy
 do_db_close:
 add r13, 1
 do_db_tail:
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4821,22 +4987,22 @@ ret
 do_dw:
 call skip_ws
 call resolve_imm_operand
+call check_imm16
 movb [r15+0], rax
 shr rax, 8
 movb [r15+1], rax
 add r15, 2
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 do_dd:
 call skip_ws
 call resolve_imm_operand
+call check_imm32u
 mov rdi, r15
 call store_dword
 add r15, 4
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 do_dq:
@@ -4883,8 +5049,7 @@ call add_fixup
 add r15, 8
 
 do_dq_tail:
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -4981,12 +5146,16 @@ mov rcx, r11
 call find_or_create_symbol
 mov r9, rax
 call skip_ws
-call parse_imm
+push r9                            ; `NAME equ OTHER_NAME` and `NAME equ -1`
+call resolve_imm_operand           ; both used to reach parse_imm, which
+pop r9                             ; reads digits and nothing else: it
+                                   ; returned 0 without advancing r13, so an
+                                   ; alias or a negative constant became 0
+                                   ; and the rest of the line was skipped
 mov rdx, rax
 mov rax, r9
 call define_const
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; SWAR dispatch: pack+mask the candidate word ONCE (content and length
@@ -5270,8 +5439,7 @@ mov rax, rbx
 add rax, CUR_SECTION_OFF
 mov [rax+0], rcx
 do_section_switch_done:
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; sec_cursor_slot -- in: rdx = section id; out: rax = address of that
@@ -5319,8 +5487,7 @@ sub rcx, r15                       ; bytes still available in .bss
 cmp rcx, rax
 jl die_section_overflow
 add r15, rax
-call skip_ws
-call skip_to_eol
+call expect_eol
 ret
 
 ; ===========================================================================

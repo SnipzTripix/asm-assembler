@@ -56,18 +56,28 @@ echo "=== %include ==="
 echo "=== review regressions ==="
 ./tests/check_review.sh "$V" || fail=1
 
+echo "=== equ aliases resolve the same in both paths ==="
+./tests/check_equ_par.sh "$V" || fail=1
+
+echo "=== input that must be rejected ==="
+./tests/check_reject.sh "$V" || fail=1
+
 echo "=== range / overflow regressions ==="
-./tests/regress_range.sh "$V"
+./tests/regress_range.sh "$V" || fail=1
 
 echo "=== parallel == serial (byte-for-byte, every worker count) ==="
-./tests/par_equiv.sh "$V" | tail -3
-./tests/par_equiv.sh "$V" >/dev/null 2>&1 || fail=1
+./tests/par_equiv.sh "$V" > /tmp/ra_par.log 2>&1 || fail=1
+tail -3 /tmp/ra_par.log; rm -f /tmp/ra_par.log   # it builds a 3.8MB input
+                                                 # and times it; running it
+                                                 # twice to get both the
+                                                 # output and the status
+                                                 # doubled that for nothing
 
 echo "=== parallel determinism ==="
-./tests/determinism.sh "$V" v1.v0 8 4
+./tests/determinism.sh "$V" v1.v0 8 4 || fail=1
 
 echo "=== cross-chunk references ==="
-./tests/repro_cross.sh "$V" 400
+./tests/repro_cross.sh "$V" 400 || fail=1
 
 echo "=== self-hosting fixed point ==="
 ./tests/fixedpoint.sh "$V" || fail=1

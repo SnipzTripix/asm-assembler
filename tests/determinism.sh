@@ -31,3 +31,7 @@ else
 fi
 [ $matchser -eq 1 ] && echo "and identical to serial" || echo "but NOT equal to serial"
 rm -f /tmp/dt_ser /tmp/dt_*
+
+# Exit status, not just a message: this script reported a race in words
+# and returned 0 regardless, so run_all.sh could not have noticed one.
+[ $allsame -eq 1 ] && [ $matchser -eq 1 ]

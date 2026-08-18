@@ -75,7 +75,9 @@ the dialect grows, so it's the source of truth, not this file. Briefly:
 - `db` with `\n \t \r \0 \\ \"` escapes, `dw`/`dd`/`dq` — and `dq label`,
   which together with `call reg` makes a function-pointer dispatch table
   expressible
-- `equ` constants, `label:` definitions, `resb`
+- `equ` constants (a number, a negative number, or the name of a
+  constant already defined, so `B equ A` aliases), `label:` definitions,
+  `resb`
 - memory operands `[base+disp]` and `[base+index*scale+disp]`
 - `.text`/`.data`/`.bss` — real ELF segments: R+X, R, and a
   zero-filled RW mapping that costs nothing in the file
@@ -116,16 +118,24 @@ writes and which the parent reads only after `wait4` says the worker is
 gone. Chunks are merged in index order, never completion order, so
 scheduling cannot affect the result.
 
-Measured on a 16-thread i5-13400F, best of 7, output to `/dev/null`:
+Measured on a 16-thread i5-13400F, warm cache, output to `/dev/null`,
+on a generated 3.86 MB source (`tests/par_scaling.sh`):
 
-| Input | `-j1` | `-j16` | Speedup |
+| Workers | Wall | CPU/wall | Throughput |
 |---|---|---|---|
-| 100k lines (1.3 MB) | 18.7 ms | 7.1 ms | **2.63×** |
-| 1M lines (13 MB) | 78.8 ms | 34.3 ms | **2.29×** |
+| `-j1` | 35 ms | 0.97 | 110 MB/s |
+| `-j2` | 27 ms | 1.5 | 143 MB/s |
+| `-j4` | 19 ms | 2.2 | 203 MB/s |
+| `-j8` | 17 ms | 2.6 | 227 MB/s |
+| `-j16` | 15 ms | 3.4 | **257 MB/s** |
 
-That is ~180 MB/s and ~380 MB/s of source respectively. Files under
-256 KB ignore the worker count and run serially — below that size,
-forking and merging cost more than they save.
+Files under 256 KB ignore the worker count and run serially — below that
+size, forking and merging cost more than they save. That threshold is
+also why the earlier numbers in this table were wrong: every test input
+was under it, so the "parallel" tests had been measuring (and checking)
+the serial path. `tests/par_equiv.sh` now reads the threshold out of the
+source, generates an input past it, and asserts that CPU time exceeds
+wall time — something a serial fallback cannot fake.
 
 The ceiling is Amdahl, not contention: a serial pre-pass has to run
 first (it finds chunk boundaries, and resolves the two things that
@@ -193,7 +203,16 @@ The pieces can also be run alone: `tests/fixedpoint.sh`,
 `tests/regress_range.sh`, `tests/run_difftest.sh`. `tests/probe.sh` is a
 non-asserting diagnostic — it throws malformed and edge-case input at
 the assembler and prints what happens, which is how the range bugs above
-were found in the first place.
+were found in the first place; `tests/check_reject.sh` is the asserting
+half of the same idea, and lists every input the assembler must refuse.
+
+That distinction turned out to matter. The suite was thorough about what
+the assembler *emits* — a fixed point, a 3504-instruction cross product
+against GNU `as` — and had nothing at all about what it should *refuse*,
+which is precisely the shape of the bugs it kept missing: input that
+assembles cleanly into the wrong program. Three other scripts were
+printing "DIFFERS" or "race condition" and exiting 0, so `run_all.sh`
+scrolled past them green; they assert now.
 
 ## Correctness stance
 
@@ -207,8 +226,24 @@ v1: immediate out of range at line 1 col 21
 ```
 
 The same applies to memory displacements wider than `disp32`, integer
-literals that overflow 64 bits, unknown string escapes, and bad index
-scales. An undefined label names the symbol instead of a position, since
+literals that overflow 64 bits, shift counts above 63, operands too wide
+for the `db`/`dw`/`dd` slot they are headed for, unknown string escapes,
+and bad index scales.
+
+A statement must also end where its line does. The dialect has no
+expressions and no comma-separated operand lists, so input that assumes
+otherwise is rejected rather than half-assembled:
+
+```
+$ printf 'mov rdi, 4+2\n' | ./v1
+v1: bad operand at line 1 col 11
+```
+
+Each of those used to be accepted: `4+2` emitted 4, `db 1, 2, 3` emitted
+one byte, `mov rax, rbx rcx` dropped the third word. Nothing was reported
+because nothing was wrong at the point the operands parsed — the evidence
+was entirely in the text that came after, which the old statement tails
+skipped without reading. An undefined label names the symbol instead of a position, since
 it is only discovered once the whole file has been scanned:
 
 ```

@@ -23,14 +23,19 @@ N=${2:-400}
 
 echo "generated $(wc -l < /tmp/rc.v0) lines"
 $V /tmp/rc.v0 /tmp/rc_ser 1 || { echo "serial FAILED"; exit 1; }
+fail=0
 for j in 2 3 4 5 8 16; do
     $V /tmp/rc.v0 /tmp/rc_par "$j" 2>/tmp/rc.err
-    if [ $? -ne 0 ]; then echo "  -j$j ERROR $(cat /tmp/rc.err)"; continue; fi
+    if [ $? -ne 0 ]; then echo "  -j$j ERROR $(cat /tmp/rc.err)"; fail=1; continue; fi
     if cmp -s /tmp/rc_ser /tmp/rc_par; then
         echo "  -j$j ok"
     else
         echo "  -j$j DIFFERS: $(cmp -l /tmp/rc_ser /tmp/rc_par | wc -l) bytes"
         cmp -l /tmp/rc_ser /tmp/rc_par | head -4
+        fail=1
     fi
 done
 rm -f /tmp/rc.v0 /tmp/rc_ser /tmp/rc_par /tmp/rc.err
+exit $fail                         # printing "DIFFERS" and exiting 0 meant
+                                   # run_all.sh scrolled past a cross-chunk
+                                   # miscompile without turning red
