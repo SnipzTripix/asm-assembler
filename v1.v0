@@ -5591,7 +5591,7 @@ msg_sectionoverflow:
 db "v1: section too large for its output buffer"
 db 0
 msg_badinclude:
-db "v1: malformed %include (expected: %include \"file\")"
+db "v1: malformed %include -- expected a quoted path"
 db 10
 db 0
 msg_includeloop:

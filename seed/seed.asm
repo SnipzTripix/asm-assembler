@@ -109,22 +109,28 @@ MAP_PRIV_ANON   equ 0x22                ; MAP_PRIVATE|MAP_ANONYMOUS
 
 ; --- memory layout: one mmap, four regions, fixed offsets from rbx ---------
 INBUF_OFF       equ 0
-OUTBUF_OFF      equ 0x10000
-SYMTAB_META_OFF equ 0x20000             ; qword: symbol count
-SYMTAB_OFF      equ 0x20008             ; entries, 32B stride
-FIXUPS_META_OFF equ 0x30000             ; qword: fixup count
-FIXUPS_OFF      equ 0x30008             ; entries, 16B stride
-LINE_OFF        equ 0x40000             ; qword: current 1-based source line
-MMAP_TOTAL      equ 0x40008             ; 256 KiB + 8 total
+OUTBUF_OFF      equ 0x100000
+SYMTAB_META_OFF equ 0x200000            ; qword: symbol count
+SYMTAB_OFF      equ 0x200008            ; entries, 32B stride
+FIXUPS_META_OFF equ 0x300000            ; qword: fixup count
+FIXUPS_OFF      equ 0x300008            ; entries, 24B stride
+LINE_OFF        equ 0x400000            ; qword: current 1-based source line
+MMAP_TOTAL      equ 0x400008
 
-BUF_LEN         equ 0x10000             ; input capacity
+; v1.v0 outgrew the original 64 KiB input buffer long ago. Because the read
+; loop simply stopped once the buffer was full, seed assembled the first
+; third of the file and then reported an undefined label for everything
+; past the cut -- which read as "seed can no longer bootstrap v1" when the
+; real fault was a silent truncation. The probe in .read_full makes that
+; failure impossible to mistake for anything else.
+BUF_LEN         equ 0x100000            ; 1 MiB input capacity
 HDR_LEN         equ 120                 ; Elf64_Ehdr(64) + Elf64_Phdr(56)
 SYM_ENT         equ 32                  ; {name_ptr:8, name_len:8, value:8, defined:8}
 FIX_ENT         equ 24                  ; {patch_off:8, sym_index:8, kind:8}
 FIX_REL32       equ 0                   ; jmp/jcc/call operand -- 4-byte PC-relative
 FIX_ABS64       equ 1                   ; mov reg,label operand -- 8-byte absolute addr
-SYM_CAP         equ 2000                ; fits in the 64K region with room
-FIX_CAP         equ 4000
+SYM_CAP         equ 20000
+FIX_CAP         equ 20000
 
 ; ---------------------------------------------------------------------------
 ; _start
@@ -159,7 +165,7 @@ _start:
     mov     rsi, rdi
     mov     rdx, BUF_LEN
     sub     rdx, r12                    ; remaining space
-    jz      .read_done                  ; buffer full
+    jz      .read_full                  ; buffer full
     xor     edi, edi                    ; fd = 0
     mov     eax, SYS_read
     syscall
@@ -168,6 +174,17 @@ _start:
     jz      .read_done                  ; EOF
     add     r12, rax
     jmp     .read_loop
+.read_full:
+    ; inbuf is exactly full: one more byte means the source was truncated
+    xor     edi, edi
+    sub     rsp, 16
+    mov     rsi, rsp
+    mov     edx, 1
+    mov     eax, SYS_read
+    syscall
+    add     rsp, 16
+    test    rax, rax
+    jg      die_toobig
 .read_done:
     add     r12, rbx                    ; r12 = absolute end pointer
     mov     r13, rbx                    ; cursor = start
@@ -643,7 +660,7 @@ resolve_fixups:
     shl     rdx, 5
     lea     rdx, [rbx + SYMTAB_OFF + rdx]
     cmp     qword [rdx + 24], 0
-    je      die_undef_label
+    je      .undef_named
     mov     rsi, [rdx + 16]              ; target value (offset from outbuf base)
     cmp     r11d, FIX_ABS64
     je      .abs64
@@ -657,6 +674,36 @@ resolve_fixups:
 .next:
     inc     r9
     jmp     .loop
+.undef_named:
+    push    rdx                          ; the write below clobbers rdx, which
+                                     ; still points at the symbol slot
+    ; name the symbol: an undefined label is only discovered here, after
+    ; the whole file is scanned, so the name is the only useful handle
+    lea     rsi, [msg_undef]
+    mov     edx, msg_undef_len
+    mov     edi, 2
+    mov     eax, SYS_write
+    syscall
+    lea     rsi, [msg_colonsp]
+    mov     edx, 2
+    mov     edi, 2
+    mov     eax, SYS_write
+    syscall
+    pop     rax
+    mov     rsi, [rax]                   ; name_ptr
+    mov     rdx, [rax + 8]               ; name_len
+    mov     edi, 2
+    mov     eax, SYS_write
+    syscall
+    lea     rsi, [msg_nl2]
+    mov     edx, 1
+    mov     edi, 2
+    mov     eax, SYS_write
+    syscall
+    mov     edi, 1
+    mov     eax, SYS_exit
+    syscall
+
 .done:
     ret
 
@@ -1134,6 +1181,54 @@ DEF_ARITH_RI xor, 6, 0x31
 DEF_ARITH_RI cmp, 7, 0x39
 
 ; ---------------------------------------------------------------------------
+; do_imul -- IMUL r64, r/m64 (REX.W + 0F AF /r).
+; Added so this bootstrap tool can still assemble the current v1.v0: unlike
+; the group-1 ops its ModRM is reg=dst, rm=src (RM, not MR), so it cannot
+; reuse emit_rr.
+; ---------------------------------------------------------------------------
+do_imul:
+    call    skip_ws
+    call    parse_reg
+    cmp     eax, -1
+    je      die_bad_operand
+    push    rax
+    call    skip_ws
+    cmp     r13, r12
+    jae     die_bad_operand
+    cmp     byte [r13], ','
+    jne     die_bad_operand
+    inc     r13
+    call    skip_ws
+    call    parse_reg
+    cmp     eax, -1
+    je      die_bad_operand
+    mov     edx, eax                     ; src
+    pop     rax                          ; dst
+    mov     cl, 0x48                     ; REX.W
+    mov     esi, eax
+    shr     esi, 3
+    shl     esi, 2                       ; REX.R from dst (it is the reg field)
+    or      cl, sil
+    mov     esi, edx
+    shr     esi, 3                       ; REX.B from src (the rm field)
+    or      cl, sil
+    mov     [r15], cl
+    mov     byte [r15 + 1], 0x0F
+    mov     byte [r15 + 2], 0xAF
+    mov     esi, eax
+    and     esi, 7
+    shl     esi, 3
+    mov     edi, edx
+    and     edi, 7
+    or      esi, edi
+    or      esi, 0xC0                    ; mod = 11
+    mov     [r15 + 3], sil
+    add     r15, 4
+    call    skip_ws
+    call    skip_to_eol
+    ret
+
+; ---------------------------------------------------------------------------
 ; shl/shr reg64, imm8 -- variable-count (shift by cl) form not implemented
 ; ---------------------------------------------------------------------------
 %macro DEF_SHIFT_I 2                     ; name, /digit
@@ -1451,6 +1546,10 @@ parse_imm:
 ; ---------------------------------------------------------------------------
 ; die_* -- error exits. fd 2, distinct message each, status 1.
 ; ---------------------------------------------------------------------------
+die_toobig:
+    lea     rsi, [msg_toobig]
+    mov     edx, msg_toobig_len
+    jmp     die
 die_mmap:
     lea     rsi, [msg_mmap]
     mov     edx, msg_mmap_len
@@ -1562,6 +1661,8 @@ print_udec:
 ; === read-only data ==========================================================
 msg_mmap:          db "seed: mmap failed", 10
 msg_mmap_len       equ $ - msg_mmap
+msg_toobig:        db "seed: input larger than buffer", 10
+msg_toobig_len     equ $ - msg_toobig
 msg_read:          db "seed: read failed", 10
 msg_read_len       equ $ - msg_read
 msg_write:         db "seed: write failed", 10
@@ -1572,6 +1673,8 @@ msg_operand:       db "seed: bad operand"
 msg_operand_len    equ $ - msg_operand
 msg_dup:           db "seed: duplicate label"
 msg_dup_len        equ $ - msg_dup
+msg_colonsp:       db ": "
+msg_nl2:           db 10
 msg_undef:         db "seed: undefined label"
 msg_undef_len      equ $ - msg_undef
 msg_toomanysyms:   db "seed: too many symbols"
@@ -1635,6 +1738,7 @@ lit_jbe:     db "jbe"
 lit_call:    db "call"
 lit_push:    db "push"
 lit_pop:     db "pop"
+lit_imul:    db "imul"
 
 align 8
 mnem_table:
@@ -1665,6 +1769,7 @@ mnem_table:
     dq lit_call,    4, do_call
     dq lit_push,    4, do_push
     dq lit_pop,     3, do_pop
+    dq lit_imul,    4, do_imul
     dq 0, 0, 0
 
 file_size equ $ - $$
