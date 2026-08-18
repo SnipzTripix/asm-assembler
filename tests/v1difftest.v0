@@ -67,6 +67,8 @@ jne target1
 jl target1
 jae target1
 call target1
+call rax
+call r10
 syscall
 ret
 add rax, rbx

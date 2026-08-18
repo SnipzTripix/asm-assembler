@@ -70,6 +70,8 @@
 	jl target1
 	jae target1
 	call target1
+	call rax
+	call r10
 	syscall
 	ret
 	.rept 60

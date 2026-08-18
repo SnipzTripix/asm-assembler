@@ -3427,287 +3427,49 @@ ret
 ; blocks (no macro facility in this dialect); only the grp1 /digit and the
 ; rr opcode differ per op.
 ; ===========================================================================
+; The six operations differ only in two constants: the /digit used by the
+; 81 /r immediate form and the opcode used by the register-register form.
+; They used to be six copy-pasted 54-line handlers; this is the same
+; behaviour parameterised, which is what the project's own design notes
+; ask for ("adding an instruction becomes adding a row to a table, not
+; writing new control flow").
 do_add:
-call skip_ws
-call parse_reg
-cmp rax, NEG_ONE
-je die_bad_operand
-push rax
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_COMMA
-jne die_bad_operand
-add r13, 1
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_MINUS
-je do_add_imm
-cmp rax, CH_0
-jl do_add_reg_or_const
-cmp rax, CH_9PLUS1
-jae do_add_reg_or_const
-do_add_imm:
-call parse_signed_imm
-mov r9, rax
-pop rax
 mov r10, 0
-call emit_grp1_imm
-jmp do_add_tail
-do_add_reg_or_const:
-call parse_reg
-cmp rax, NEG_ONE
-jne do_add_have_src
-call scan_ident
-cmp rcx, 0
-je die_bad_operand
-call try_resolve_const
-cmp rdx, 0
-je die_bad_operand
-mov r9, rax
-pop rax
-mov r10, 0
-call emit_grp1_imm
-jmp do_add_tail
-do_add_have_src:
-mov rdx, rax
-pop rax
-mov r10, 0x01
-call emit_rr
-do_add_tail:
-call skip_ws
-call skip_to_eol
-ret
-
-do_sub:
-call skip_ws
-call parse_reg
-cmp rax, NEG_ONE
-je die_bad_operand
-push rax
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_COMMA
-jne die_bad_operand
-add r13, 1
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_MINUS
-je do_sub_imm
-cmp rax, CH_0
-jl do_sub_reg_or_const
-cmp rax, CH_9PLUS1
-jae do_sub_reg_or_const
-do_sub_imm:
-call parse_signed_imm
-mov r9, rax
-pop rax
-mov r10, 5
-call emit_grp1_imm
-jmp do_sub_tail
-do_sub_reg_or_const:
-call parse_reg
-cmp rax, NEG_ONE
-jne do_sub_have_src
-call scan_ident
-cmp rcx, 0
-je die_bad_operand
-call try_resolve_const
-cmp rdx, 0
-je die_bad_operand
-mov r9, rax
-pop rax
-mov r10, 5
-call emit_grp1_imm
-jmp do_sub_tail
-do_sub_have_src:
-mov rdx, rax
-pop rax
-mov r10, 0x29
-call emit_rr
-do_sub_tail:
-call skip_ws
-call skip_to_eol
-ret
-
-do_and:
-call skip_ws
-call parse_reg
-cmp rax, NEG_ONE
-je die_bad_operand
-push rax
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_COMMA
-jne die_bad_operand
-add r13, 1
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_MINUS
-je do_and_imm
-cmp rax, CH_0
-jl do_and_reg_or_const
-cmp rax, CH_9PLUS1
-jae do_and_reg_or_const
-do_and_imm:
-call parse_signed_imm
-mov r9, rax
-pop rax
-mov r10, 4
-call emit_grp1_imm
-jmp do_and_tail
-do_and_reg_or_const:
-call parse_reg
-cmp rax, NEG_ONE
-jne do_and_have_src
-call scan_ident
-cmp rcx, 0
-je die_bad_operand
-call try_resolve_const
-cmp rdx, 0
-je die_bad_operand
-mov r9, rax
-pop rax
-mov r10, 4
-call emit_grp1_imm
-jmp do_and_tail
-do_and_have_src:
-mov rdx, rax
-pop rax
-mov r10, 0x21
-call emit_rr
-do_and_tail:
-call skip_ws
-call skip_to_eol
-ret
-
+mov r11, 0x01
+jmp do_arith
 do_or:
-call skip_ws
-call parse_reg
-cmp rax, NEG_ONE
-je die_bad_operand
-push rax
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_COMMA
-jne die_bad_operand
-add r13, 1
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_MINUS
-je do_or_imm
-cmp rax, CH_0
-jl do_or_reg_or_const
-cmp rax, CH_9PLUS1
-jae do_or_reg_or_const
-do_or_imm:
-call parse_signed_imm
-mov r9, rax
-pop rax
 mov r10, 1
-call emit_grp1_imm
-jmp do_or_tail
-do_or_reg_or_const:
-call parse_reg
-cmp rax, NEG_ONE
-jne do_or_have_src
-call scan_ident
-cmp rcx, 0
-je die_bad_operand
-call try_resolve_const
-cmp rdx, 0
-je die_bad_operand
-mov r9, rax
-pop rax
-mov r10, 1
-call emit_grp1_imm
-jmp do_or_tail
-do_or_have_src:
-mov rdx, rax
-pop rax
-mov r10, 0x09
-call emit_rr
-do_or_tail:
-call skip_ws
-call skip_to_eol
-ret
-
+mov r11, 0x09
+jmp do_arith
+do_and:
+mov r10, 4
+mov r11, 0x21
+jmp do_arith
+do_sub:
+mov r10, 5
+mov r11, 0x29
+jmp do_arith
 do_xor:
-call skip_ws
-call parse_reg
-cmp rax, NEG_ONE
-je die_bad_operand
-push rax
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_COMMA
-jne die_bad_operand
-add r13, 1
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_MINUS
-je do_xor_imm
-cmp rax, CH_0
-jl do_xor_reg_or_const
-cmp rax, CH_9PLUS1
-jae do_xor_reg_or_const
-do_xor_imm:
-call parse_signed_imm
-mov r9, rax
-pop rax
 mov r10, 6
-call emit_grp1_imm
-jmp do_xor_tail
-do_xor_reg_or_const:
-call parse_reg
-cmp rax, NEG_ONE
-jne do_xor_have_src
-call scan_ident
-cmp rcx, 0
-je die_bad_operand
-call try_resolve_const
-cmp rdx, 0
-je die_bad_operand
-mov r9, rax
-pop rax
-mov r10, 6
-call emit_grp1_imm
-jmp do_xor_tail
-do_xor_have_src:
-mov rdx, rax
-pop rax
-mov r10, 0x31
-call emit_rr
-do_xor_tail:
-call skip_ws
-call skip_to_eol
-ret
-
+mov r11, 0x31
+jmp do_arith
 do_cmp:
+mov r10, 7
+mov r11, 0x39
+jmp do_arith
+
+; do_arith -- in: r10 = grp1 /digit, r11 = reg-reg opcode.
+; Both are pushed immediately: parse_reg, parse_signed_imm, scan_ident and
+; try_resolve_const all clobber r10/r11, so nothing may stay there across
+; the operand parse.
+do_arith:
+push r10
+push r11
 call skip_ws
 call parse_reg
 cmp rax, NEG_ONE
 je die_bad_operand
-push rax
+push rax                           ; [rsp]=dst [rsp+8]=rr op [rsp+16]=digit
 call skip_ws
 cmp r13, r12
 jae die_bad_operand
@@ -3720,23 +3482,26 @@ cmp r13, r12
 jae die_bad_operand
 movb rax, [r13+0]
 cmp rax, CH_MINUS
-je do_cmp_imm
+je do_arith_imm
 cmp rax, CH_0
-jl do_cmp_reg_or_const
+jl do_arith_reg_or_const
 cmp rax, CH_9PLUS1
-jae do_cmp_reg_or_const
-do_cmp_imm:
+jae do_arith_reg_or_const
+
+do_arith_imm:
 call parse_signed_imm
 mov r9, rax
-pop rax
-mov r10, 7
+pop rax                            ; dst
+pop r11
+pop r10                            ; digit
 call emit_grp1_imm
-jmp do_cmp_tail
-do_cmp_reg_or_const:
+jmp do_arith_tail
+
+do_arith_reg_or_const:
 call parse_reg
 cmp rax, NEG_ONE
-jne do_cmp_have_src
-call scan_ident
+jne do_arith_have_src
+call scan_ident                    ; not a register: must be an equ name
 cmp rcx, 0
 je die_bad_operand
 call try_resolve_const
@@ -3744,15 +3509,20 @@ cmp rdx, 0
 je die_bad_operand
 mov r9, rax
 pop rax
-mov r10, 7
+pop r11
+pop r10
 call emit_grp1_imm
-jmp do_cmp_tail
-do_cmp_have_src:
-mov rdx, rax
-pop rax
-mov r10, 0x39
+jmp do_arith_tail
+
+do_arith_have_src:
+mov rdx, rax                       ; src
+pop rax                            ; dst
+pop r11
+pop r10
+mov r10, r11                       ; emit_rr takes the opcode in r10
 call emit_rr
-do_cmp_tail:
+
+do_arith_tail:
 call skip_ws
 call skip_to_eol
 ret
@@ -3961,121 +3731,35 @@ ret
 ; ===========================================================================
 ; movb reg,[reg+N] / movb [reg+N],reg -- byte load/store
 ; ===========================================================================
+; ===========================================================================
+; movb / movw / movd reg,[mem] and [mem],reg -- 8/16/32-bit memory access.
+; The three differ only in which pair of emitters they use, so they share
+; one body and pass those in. (64-bit access is plain `mov`, handled by
+; do_mov, which also has register and immediate forms these do not.)
+; ===========================================================================
 do_movb:
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_LBRACKET
-je do_movb_store
-
-call parse_reg
-cmp rax, NEG_ONE
-je die_bad_operand
-push rax
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_COMMA
-jne die_bad_operand
-add r13, 1
-call skip_ws
-call parse_mem
-mov rdx, rax
-pop rax
-call emit_movb_load
-jmp do_movb_tail
-
-do_movb_store:
-call parse_mem
-mov rdx, rax
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_COMMA
-jne die_bad_operand
-add r13, 1
-call skip_ws
-push rdx
-push r9
-call parse_reg
-cmp rax, NEG_ONE
-je die_bad_operand
-pop r9
-pop rdx
-call emit_movb_store
-do_movb_tail:
-call skip_ws
-call skip_to_eol
-ret
-
-; ===========================================================================
-; movw reg,[reg+N] / movw [reg+N],reg -- 16-bit load/store, same shape as
-; do_movb with the wider emit_movw_load/store.
-; ===========================================================================
+mov r10, 0
+jmp do_movsz
 do_movw:
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_LBRACKET
-je do_movw_store
-
-call parse_reg
-cmp rax, NEG_ONE
-je die_bad_operand
-push rax
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_COMMA
-jne die_bad_operand
-add r13, 1
-call skip_ws
-call parse_mem
-mov rdx, rax
-pop rax
-call emit_movw_load
-jmp do_movw_tail
-
-do_movw_store:
-call parse_mem
-mov rdx, rax
-call skip_ws
-cmp r13, r12
-jae die_bad_operand
-movb rax, [r13+0]
-cmp rax, CH_COMMA
-jne die_bad_operand
-add r13, 1
-call skip_ws
-push rdx
-push r9
-call parse_reg
-cmp rax, NEG_ONE
-je die_bad_operand
-pop r9
-pop rdx
-call emit_movw_store
-do_movw_tail:
-call skip_ws
-call skip_to_eol
-ret
-
-; ===========================================================================
-; movd reg,[reg+N] / movd [reg+N],reg -- 32-bit load/store, same shape as
-; do_movb with the wider emit_movd_load/store.
-; ===========================================================================
+mov r10, 1
+jmp do_movsz
 do_movd:
+mov r10, 2
+jmp do_movsz
+
+; do_movsz -- in: r10 = width selector (0=byte, 1=word, 2=dword).
+; Stashed on the stack straight away: parse_reg and parse_mem both
+; clobber r10. A selector plus a short branch is used rather than an
+; emitter address plus an indirect call, so that this file stays
+; assemblable by a compiler generation that predates `call reg`.
+do_movsz:
+push r10
 call skip_ws
 cmp r13, r12
 jae die_bad_operand
 movb rax, [r13+0]
 cmp rax, CH_LBRACKET
-je do_movd_store
+je do_movsz_store
 
 call parse_reg
 cmp rax, NEG_ONE
@@ -4089,13 +3773,24 @@ cmp rax, CH_COMMA
 jne die_bad_operand
 add r13, 1
 call skip_ws
-call parse_mem
+call parse_mem                     ; -> rax = base, r9 = disp
 mov rdx, rax
-pop rax
+pop rax                            ; dst register
+pop r10                            ; width selector
+cmp r10, 0
+je do_movsz_load_b
+cmp r10, 1
+je do_movsz_load_w
 call emit_movd_load
-jmp do_movd_tail
+jmp do_movsz_tail
+do_movsz_load_b:
+call emit_movb_load
+jmp do_movsz_tail
+do_movsz_load_w:
+call emit_movw_load
+jmp do_movsz_tail
 
-do_movd_store:
+do_movsz_store:
 call parse_mem
 mov rdx, rax
 call skip_ws
@@ -4106,15 +3801,27 @@ cmp rax, CH_COMMA
 jne die_bad_operand
 add r13, 1
 call skip_ws
-push rdx
+push rdx                           ; base and disp must survive parse_reg
 push r9
 call parse_reg
 cmp rax, NEG_ONE
 je die_bad_operand
 pop r9
 pop rdx
+pop r10                            ; width selector
+cmp r10, 0
+je do_movsz_store_b
+cmp r10, 1
+je do_movsz_store_w
 call emit_movd_store
-do_movd_tail:
+jmp do_movsz_tail
+do_movsz_store_b:
+call emit_movb_store
+jmp do_movsz_tail
+do_movsz_store_w:
+call emit_movw_store
+jmp do_movsz_tail
+do_movsz_tail:
 call skip_ws
 call skip_to_eol
 ret
@@ -4185,12 +3892,42 @@ call skip_ws
 call skip_to_eol
 ret
 
+; call takes either a label (E8 rel32) or a register (FF /2), the latter
+; being an indirect call through an address held in a register -- which,
+; together with `dq label`, is what makes a real function-pointer
+; dispatch table expressible. parse_reg leaves the cursor untouched when
+; it does not match, so the label form picks up cleanly after a miss.
 do_call:
 call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+jne do_call_indirect
 mov rax, 0xE8
 movb [r15+0], rax
 add r15, 1
 call emit_rel32_ref
+jmp do_call_tail
+
+do_call_indirect:
+; FF /2, mod=11: no REX.W -- a near call defaults to 64-bit operand size
+; in long mode -- but REX.B is needed to reach r8..r15
+mov rcx, rax
+shr rcx, 3
+cmp rcx, 0
+je do_call_norex
+mov rdx, 0x41                      ; REX.B
+movb [r15+0], rdx
+add r15, 1
+do_call_norex:
+mov rdx, 0xFF
+movb [r15+0], rdx
+mov rdx, rax
+and rdx, 7
+add rdx, 0xD0                      ; mod=11 (0xC0) | digit 2 (0x10) | rm
+movb [r15+1], rdx
+add r15, 2
+
+do_call_tail:
 call skip_ws
 call skip_to_eol
 ret

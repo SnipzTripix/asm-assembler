@@ -38,6 +38,9 @@ run_prog sections 0
 echo "=== data directives (dw/dd/dq, dq-label jump table) ==="
 ./tests/check_data_dirs.sh "$V" || fail=1
 
+echo "=== function-pointer dispatch (dq label + call reg) ==="
+./tests/check_dispatch.sh "$V" || fail=1
+
 echo "=== range / overflow regressions ==="
 ./tests/regress_range.sh "$V"
 

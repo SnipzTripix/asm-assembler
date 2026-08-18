@@ -1,0 +1,52 @@
+; dispatch.v0 -- a genuine function-pointer dispatch table: `dq label`
+; builds the table, `call reg` calls through it. Neither existed before,
+; and the assembler's own source carried a comment saying a table-driven
+; dispatch "would need `dq label` support this dialect still doesn't
+; have". Exits 42 only if the right handler ran for each index.
+.text
+mov rbp, rsp
+mov rcx, 64
+sub rsp, rcx
+mov rax, 0
+mov [rbp-8], rax                 ; accumulator
+
+mov rbx, 0                       ; index
+loop_top:
+mov rcx, 3
+cmp rbx, rcx
+jae loop_done
+
+mov rax, handlers
+mov rcx, rbx
+shl rcx, 3
+add rax, rcx
+mov r10, [rax+0]
+call r10                         ; indirect call through the table
+
+mov rcx, [rbp-8]
+add rcx, rax
+mov [rbp-8], rcx
+add rbx, 1
+jmp loop_top
+loop_done:
+
+; 2 + 13 + 27 = 42
+mov rdi, [rbp-8]
+mov rax, 60
+syscall
+
+h0:
+mov rax, 2
+ret
+h1:
+mov rax, 13
+ret
+h2:
+mov rax, 27
+ret
+
+.data
+handlers:
+dq h0
+dq h1
+dq h2
