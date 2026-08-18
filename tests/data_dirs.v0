@@ -1,0 +1,59 @@
+; data_dirs.v0 -- dw/dd/dq, including a jump table built from `dq label`,
+; which is the construct that was impossible before these existed.
+; Exits with 42 by dispatching through the table rather than branching.
+MAGIC equ 0x1234
+
+.text
+mov rbp, rsp
+mov rcx, 32
+sub rsp, rcx
+
+; --- dispatch through a dq table: entry 1 -> second_case ---
+mov rax, table
+mov rcx, 1
+shl rcx, 3
+add rax, rcx
+mov rax, [rax+0]
+jmp_target:
+push rax
+ret                      ; jump to the address just pushed
+
+first_case:
+mov rax, 60
+mov rdi, 99
+syscall
+
+second_case:
+; verify the dw/dd values round-tripped correctly before exiting 42
+mov rax, values
+movw rcx, [rax+0]
+mov rdx, MAGIC
+cmp rcx, rdx
+jne bad
+movd rcx, [rax+4]
+mov rdx, 0x89ABCDEF
+cmp rcx, rdx
+jne bad
+mov rcx, [rax+8]
+mov rdx, 0x1122334455667788
+cmp rcx, rdx
+jne bad
+mov rax, 60
+mov rdi, 42
+syscall
+
+bad:
+mov rax, 60
+mov rdi, 7
+syscall
+
+.data
+table:
+dq first_case
+dq second_case
+
+values:
+dw MAGIC
+dw 0
+dd 0x89ABCDEF
+dq 0x1122334455667788

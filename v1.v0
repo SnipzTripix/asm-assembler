@@ -310,6 +310,9 @@ PACK_TEXT       equ 0x74786574
 PACK_DATA       equ 0x61746164
 PACK_TEST       equ 0x74736574
 PACK_NEG        equ 0x67656E
+PACK_DW         equ 0x7764
+PACK_DD         equ 0x6464
+PACK_DQ         equ 0x7164
 
 ; ===========================================================================
 ; entry point -- mmap the working set, read all of stdin, parse, resolve
@@ -4297,6 +4300,86 @@ call skip_to_eol
 ret
 
 ; ===========================================================================
+; dw / dd / dq -- emit a 2, 4 or 8 byte little-endian value.
+;
+; dq additionally accepts a LABEL, which is what makes a jump table
+; expressible at all: the value is a placeholder plus an ABS64 fixup, the
+; same mechanism `mov reg, label` uses, so it resolves to a runtime
+; address and works across .text/.data and across parallel chunks.
+; dw/dd take numbers or equ constants only -- a 2 or 4 byte slot cannot
+; hold a 64-bit address, and silently truncating one would be exactly the
+; class of quiet wrong answer the range checks elsewhere exist to prevent.
+; ===========================================================================
+do_dw:
+call skip_ws
+call resolve_imm_operand
+movb [r15+0], rax
+shr rax, 8
+movb [r15+1], rax
+add r15, 2
+call skip_ws
+call skip_to_eol
+ret
+
+do_dd:
+call skip_ws
+call resolve_imm_operand
+mov rdi, r15
+call store_dword
+add r15, 4
+call skip_ws
+call skip_to_eol
+ret
+
+do_dq:
+call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_MINUS
+je do_dq_number
+cmp rax, CH_0
+jl do_dq_symbol
+cmp rax, CH_9PLUS1
+jae do_dq_symbol
+do_dq_number:
+call parse_signed_imm
+mov [r15+0], rax
+add r15, 8
+jmp do_dq_tail
+
+do_dq_symbol:
+; an equ constant resolves to its value; anything else is a label address
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+call try_resolve_const
+cmp rdx, 0
+je do_dq_label
+mov [r15+0], rax
+add r15, 8
+jmp do_dq_tail
+
+do_dq_label:
+call find_or_create_symbol
+mov r10, rax                       ; symbol slot
+mov rcx, 0
+mov [r15+0], rcx                   ; placeholder, patched by the fixup pass
+call section_base                  ; rax = base, rdx = section id
+mov r11, rdx
+mov rdx, r15
+sub rdx, rax                       ; patch offset within this section
+mov rax, r10
+mov rcx, FIX_ABS64
+call add_fixup
+add r15, 8
+
+do_dq_tail:
+call skip_ws
+call skip_to_eol
+ret
+
+; ===========================================================================
 ; parse_stmt -- "ident:" defines a label, "ident equ imm" defines a
 ; constant, otherwise ident is a mnemonic matched by a compare chain.
 ;   r10/r11 stash word1 (name ptr/len) across everything below -- neither
@@ -4412,10 +4495,16 @@ je parse_stmt_call_call
 jmp die_unknown_mnem
 
 parse_stmt_bucket_d:
-cmp r9, 100                         ; 'd': db
+cmp r9, 100                         ; 'd': db, dw, dd, dq
 jne parse_stmt_bucket_i
 cmp r8, PACK_DB
 je parse_stmt_call_db
+cmp r8, PACK_DW
+je parse_stmt_call_dw
+cmp r8, PACK_DD
+je parse_stmt_call_dd
+cmp r8, PACK_DQ
+je parse_stmt_call_dq
 jmp die_unknown_mnem
 
 parse_stmt_bucket_i:
@@ -4540,6 +4629,15 @@ call do_ret
 ret
 parse_stmt_call_db:
 call do_db
+ret
+parse_stmt_call_dw:
+call do_dw
+ret
+parse_stmt_call_dd:
+call do_dd
+ret
+parse_stmt_call_dq:
+call do_dq
 ret
 parse_stmt_call_lea:
 call do_lea

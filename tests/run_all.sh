@@ -35,6 +35,9 @@ run_prog hello    0
 run_prog edge     7
 run_prog sections 0
 
+echo "=== data directives (dw/dd/dq, dq-label jump table) ==="
+./tests/check_data_dirs.sh "$V" || fail=1
+
 echo "=== range / overflow regressions ==="
 ./tests/regress_range.sh "$V"
 
