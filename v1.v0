@@ -302,7 +302,6 @@ SYM_POP_MAX     equ 229376              ; 7/8 of SYM_CAP -- open addressing
                                          ; bounded instead of risking an
                                          ; unterminated scan on a full table
 FIX_CAP         equ 200000
-REG_ENT_LEN     equ 11
 LOAD_BASE       equ 0x400000
 FNV_OFFSET      equ 0xCBF29CE484222325
 FNV_PRIME       equ 0x100000001B3
@@ -393,6 +392,28 @@ PACK_DD         equ 0x6464
 PACK_DQ         equ 0x7164
 PACK_BSS        equ 0x737362
 PACK_RESB       equ 0x62736572
+
+; --- and the register names, packed the same way. Ordered by how often
+; each register actually appears in v1.v0, which is the only workload
+; this assembler is guaranteed to assemble: rax alone is 1154 of the
+; ~4200 register mentions, and the first four cover more than half. A
+; compare chain pays for its position, so the order is data, not taste. -
+PACK_RAX        equ 0x786172
+PACK_RCX        equ 0x786372
+PACK_RDX        equ 0x786472
+PACK_RSI        equ 0x697372
+PACK_RDI        equ 0x696472
+PACK_R10        equ 0x303172
+PACK_R13        equ 0x333172
+PACK_R15        equ 0x353172
+PACK_RBX        equ 0x786272
+PACK_R11        equ 0x313172
+PACK_R12        equ 0x323172
+PACK_RSP        equ 0x707372
+PACK_R14        equ 0x343172
+PACK_RBP        equ 0x706272
+PACK_R8         equ 0x3872
+PACK_R9         equ 0x3972
 
 ; ===========================================================================
 ; entry point -- mmap the working set, read all of stdin, parse, resolve
@@ -977,20 +998,25 @@ syscall
 ; skip_ws -- advance r13 past spaces/tabs only (not newline)
 ; ===========================================================================
 skip_ws:
+push rdx                            ; many callers hold live state in rdx
+mov rdx, class_tbl                  ; across a skip_ws call (the old,
+                                    ; pre-table skip_ws never touched it,
+                                    ; so nothing preserved it explicitly).
+                                    ; Saved once per call rather than once
+                                    ; per space, same as scan_ident.
+skip_ws_loop:
 cmp r13, r12
 jae skip_ws_ret
 movb rax, [r13+0]
-push rdx                            ; many callers hold live state in rdx
-mov rdx, class_tbl                  ; across a skip_ws call (the old,
-add rdx, rax                        ; pre-table skip_ws never touched it,
-movb rdx, [rdx+0]                   ; so nothing preserved it explicitly)
-and rdx, CLS_SPACE
-cmp rdx, 0
-pop rdx
+add rax, rdx
+movb rax, [rax+0]
+and rax, CLS_SPACE
+cmp rax, 0
 je skip_ws_ret
 add r13, 1
-jmp skip_ws
+jmp skip_ws_loop
 skip_ws_ret:
+pop rdx
 ret
 
 ; ===========================================================================
@@ -1053,21 +1079,25 @@ ret
 ; ===========================================================================
 scan_ident:
 mov rsi, r13
+push rdx                            ; rdx is preserved for callers, but it
+mov rdx, class_tbl                  ; used to be saved and restored around
+                                    ; every single character; once per call
+                                    ; is the same promise. Holding the table
+                                    ; base here also stops the loop
+                                    ; reloading the address each iteration.
 scan_ident_loop:
 cmp r13, r12
 jae scan_ident_done
 movb rax, [r13+0]
-push rdx                            ; same rdx-preservation concern as
-mov rdx, class_tbl                  ; skip_ws -- see its comment
-add rdx, rax
-movb rdx, [rdx+0]
-and rdx, CLS_ICONT
-cmp rdx, 0
-pop rdx
+add rax, rdx
+movb rax, [rax+0]
+and rax, CLS_ICONT
+cmp rax, 0
 je scan_ident_done
 add r13, 1
 jmp scan_ident_loop
 scan_ident_done:
+pop rdx
 mov rcx, r13
 sub rcx, rsi
 ret
@@ -1147,46 +1177,129 @@ and rax, rdx
 ret
 
 ; ===========================================================================
-; parse_reg -- match a register name at r13 against reg_table
+; parse_reg -- match a register name at r13
 ;   out: rax = register number 0..15, or NEG_ONE if no match (r13 left
 ;   unchanged on failure, same contract as seed's version)
-;   clob: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11
+;   clob: rax, rcx, rdx, rsi, r11
+;
+; This used to walk an 11-byte-stride reg_table of up to 16 entries,
+; calling bytes_eq for each -- so recognising r15 meant sixteen function
+; calls, each saving four registers and running a byte loop, and every
+; label operand paid all sixteen before being rejected. It is now the
+; same masked-qword compare the mnemonic dispatch uses: two instructions
+; to pack, then a chain ordered by how often each register appears.
+; reg_table and REG_ENT_LEN are gone with it rather than left declared.
 ; ===========================================================================
 parse_reg:
-mov r10, reg_table
-mov r11, 16
-parse_reg_try:
-movb rcx, [r10+0]
-mov rsi, r13
-mov rdi, r10
-add rdi, 3
-mov rdx, rcx
-call bytes_eq
-cmp rax, 1
-jne parse_reg_next
-movb rdx, [r10+0]
-mov rax, r13
-add rax, rdx
-cmp rax, r12
-jae parse_reg_accept
-movb rax, [rax+0]
-mov rdx, class_tbl
-add rdx, rax
-movb rdx, [rdx+0]
-and rdx, CLS_ICONT
-cmp rdx, 0
-je parse_reg_accept
-jmp parse_reg_next
-parse_reg_accept:
-movb rax, [r10+0]
-add r13, rax
-movb rax, [r10+1]
+mov r11, r13                       ; failure must leave r13 where it was:
+                                   ; every caller that tries a register
+                                   ; first and falls back to a label or an
+                                   ; immediate depends on it. r11 because
+                                   ; the old loop used r10/r11 as its state
+                                   ; and callers already treat both as gone
+call scan_ident
+cmp rcx, 2                         ; every register name is 2 or 3 bytes,
+jl parse_reg_no                    ; so anything else is decided before a
+cmp rcx, 4                         ; single comparison happens (jae, not
+jae parse_reg_no                   ; ja: this dialect has no ja)
+cmp rcx, 2
+je parse_reg_len2
+
+mov rax, [rsi+0]                   ; the pack is two instructions here, not
+and rax, 0xFFFFFF                  ; a swar_pack call: the length is known
+                                   ; exactly, so the mask is a constant
+                                   ; rather than something to build in a
+                                   ; loop -- and this way r8 stays untouched
+cmp rax, PACK_RAX
+je parse_reg_0
+cmp rax, PACK_RCX
+je parse_reg_1
+cmp rax, PACK_RDX
+je parse_reg_2
+cmp rax, PACK_RSI
+je parse_reg_6
+cmp rax, PACK_RDI
+je parse_reg_7
+cmp rax, PACK_R10
+je parse_reg_10
+cmp rax, PACK_R13
+je parse_reg_13
+cmp rax, PACK_R15
+je parse_reg_15
+cmp rax, PACK_RBX
+je parse_reg_3
+cmp rax, PACK_R11
+je parse_reg_11
+cmp rax, PACK_R12
+je parse_reg_12
+cmp rax, PACK_RSP
+je parse_reg_4
+cmp rax, PACK_R14
+je parse_reg_14
+cmp rax, PACK_RBP
+je parse_reg_5
+jmp parse_reg_no
+
+parse_reg_len2:
+mov rax, [rsi+0]
+and rax, 0xFFFF
+cmp rax, PACK_R9
+je parse_reg_9
+cmp rax, PACK_R8
+je parse_reg_8
+jmp parse_reg_no
+
+parse_reg_0:
+mov rax, 0
 ret
-parse_reg_next:
-add r10, REG_ENT_LEN
-sub r11, 1
-cmp r11, 0
-jne parse_reg_try
+parse_reg_1:
+mov rax, 1
+ret
+parse_reg_2:
+mov rax, 2
+ret
+parse_reg_3:
+mov rax, 3
+ret
+parse_reg_4:
+mov rax, 4
+ret
+parse_reg_5:
+mov rax, 5
+ret
+parse_reg_6:
+mov rax, 6
+ret
+parse_reg_7:
+mov rax, 7
+ret
+parse_reg_8:
+mov rax, 8
+ret
+parse_reg_9:
+mov rax, 9
+ret
+parse_reg_10:
+mov rax, 10
+ret
+parse_reg_11:
+mov rax, 11
+ret
+parse_reg_12:
+mov rax, 12
+ret
+parse_reg_13:
+mov rax, 13
+ret
+parse_reg_14:
+mov rax, 14
+ret
+parse_reg_15:
+mov rax, 15
+ret
+
+parse_reg_no:
+mov r13, r11
 mov rax, NEG_ONE
 ret
 
@@ -5799,158 +5912,6 @@ db ": "
 db 0
 msg_nl:
 db 10
-db 0
-
-; reg_table entry = { u8 name_len, u8 reg_num, u8 pad, char name[8] } --
-; fixed 11-byte stride, built as one db statement per byte/string chunk
-; since this dialect's db takes exactly one string or one numeric value,
-; never a comma-separated list.
-reg_table:
-db 3
-db 0
-db 0
-db "rax"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 1
-db 0
-db "rcx"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 2
-db 0
-db "rdx"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 3
-db 0
-db "rbx"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 4
-db 0
-db "rsp"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 5
-db 0
-db "rbp"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 6
-db 0
-db "rsi"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 7
-db 0
-db "rdi"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 2
-db 8
-db 0
-db "r8"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 0
-db 2
-db 9
-db 0
-db "r9"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 10
-db 0
-db "r10"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 11
-db 0
-db "r11"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 12
-db 0
-db "r12"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 13
-db 0
-db "r13"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 14
-db 0
-db "r14"
-db 0
-db 0
-db 0
-db 0
-db 0
-db 3
-db 15
-db 0
-db "r15"
-db 0
-db 0
-db 0
-db 0
 db 0
 
 ; "equ" is still checked via bytes_eq in parse_stmt_checkequ (a one-off

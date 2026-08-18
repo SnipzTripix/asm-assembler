@@ -119,15 +119,15 @@ gone. Chunks are merged in index order, never completion order, so
 scheduling cannot affect the result.
 
 Measured on a 16-thread i5-13400F, warm cache, output to `/dev/null`,
-on a generated 3.86 MB source (`tests/par_scaling.sh`):
+on a generated 3.83 MB source (`tests/par_scaling.sh`):
 
 | Workers | Wall | CPU/wall | Throughput |
 |---|---|---|---|
-| `-j1` | 35 ms | 0.97 | 110 MB/s |
-| `-j2` | 27 ms | 1.5 | 143 MB/s |
-| `-j4` | 19 ms | 2.2 | 203 MB/s |
-| `-j8` | 17 ms | 2.6 | 227 MB/s |
-| `-j16` | 15 ms | 3.4 | **257 MB/s** |
+| `-j1` | 34 ms | 0.97 | 113 MB/s |
+| `-j2` | 26 ms | 1.5 | 147 MB/s |
+| `-j4` | 18 ms | 2.1 | 213 MB/s |
+| `-j8` | 16 ms | 2.6 | 239 MB/s |
+| `-j16` | 15 ms | 3.2 | **255 MB/s** |
 
 Files under 256 KB ignore the worker count and run serially — below that
 size, forking and merging cost more than they save. That threshold is
@@ -152,9 +152,27 @@ Symbol lookup is an FNV-1a open-addressed hash table (was a linear scan
 until it was measured to be the actual bottleneck: 55x slower on a
 100k-line file with 10,000 labels). Mnemonic dispatch is a masked-qword
 (SWAR) compare bucketed by first letter, not a byte-by-byte string
-comparison. Character classification is a branchless 256-byte lookup
-table. On a 100k-line / ~1.3MB source file: ~20ms, comfortably past the
-50MB/s design target.
+comparison. Register names go through the same masked compare, ordered
+by how often each register actually occurs — it was a linear walk of an
+11-byte-stride table calling a byte-loop comparison per entry, so
+recognising `r15` cost sixteen function calls and every label operand
+paid all sixteen before being rejected. Character classification is a
+branchless 256-byte lookup table.
+
+On a 100k-line / 1.25 MB source file: ~18 ms.
+
+Two notes on measuring any of this, both learned the hard way:
+
+- The benchmark generator used to emit only `rax`/`rbx`/`rcx`/`rdx`,
+  which were the first four entries of the old register table. Rewriting
+  register parsing made register-dense code 1.9x faster and moved the
+  benchmark by nothing at all. It emits a spread across all 16 registers
+  now, and shows 1.25x on the same change.
+- The first-letter bucket chain in mnemonic dispatch was going to become
+  a `dq label` jump table until it was measured: the difference between
+  the first bucket and the last, on 200k statements, is about 2.5 ns per
+  statement. An indirect branch across fourteen targets would likely
+  have cost more than the compares it replaced. It stayed a chain.
 
 ```
 tests/gen_big.sh 10000 > /tmp/big.v0
