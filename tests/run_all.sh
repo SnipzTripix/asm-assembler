@@ -75,6 +75,9 @@ echo "=== self-hosting fixed point ==="
 echo "=== differential vs an independent assembler ==="
 ./tests/run_difftest.sh || fail=1
 
+echo "=== exhaustive differential (generated cross product) ==="
+./tests/gen_difftest.sh "$V" || fail=1
+
 echo
 if [ $fail -eq 0 ]; then
     echo "ALL PASS"

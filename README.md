@@ -151,6 +151,30 @@ tests/gen_big.sh 10000 > /tmp/big.v0
 time ./v1 < /tmp/big.v0 > /dev/null
 ```
 
+## Building from source
+
+The whole chain rebuilds from `seed.asm` with `nasm` as the only trusted
+input:
+
+```
+./bootstrap.sh
+```
+
+```
+nasm    seed.asm -> seed
+seed    v1.v0    -> stage1
+stage1  v1.v0    -> stage2
+stage2  v1.v0    -> stage3      require stage2 == stage3
+```
+
+`stage2 == stage3` is the proof that matters: stage2 came from a compiler
+built from source, so its reproducing itself means the whole chain is
+reproducible from `seed.asm`. The committed `v1` binary is then compared
+against stage2 — which makes it a convenience rather than a dependency,
+and proves it. (stage1 is deliberately *not* compared: seed is a cruder
+assembler and emits an equivalent but different binary; only from stage2
+on is the output self-hosted.)
+
 ## Running the tests
 
 ```
@@ -194,6 +218,15 @@ v1: undefined label: nowhere_at_all
 Every error path exits nonzero with a distinct message on stderr — there
 are no assertion failures or segfaults on malformed input.
 
-The differential test against GNU `as` is what backs this up: it has
-caught real defects more than once, including a redundant REX prefix on
-every low-register `movd`/`movw`, found the day it was reconnected.
+The differential test against GNU `as` is what backs this up. It runs in
+two forms: a hand-written file covering every instruction form, and
+`tests/gen_difftest.sh`, which generates the full cross product — every
+ALU op across all 16×16 register pairs, every memory form across all
+bases, indices and scales, every unary form across all 16 registers,
+3504 instructions in total — and requires all 17250 bytes to match.
+Generating it rather than hand-writing it is what turns "no known
+encoding bugs" into "no encoding bugs in the tested space", and it is
+what makes changing the encoder safe.
+
+It has caught real defects, including a redundant REX prefix on every
+low-register `movd`/`movw`, found the day it was reconnected.

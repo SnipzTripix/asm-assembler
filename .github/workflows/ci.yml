@@ -1,0 +1,32 @@
+name: build and test
+
+# The correctness of this project rests on two equalities -- the assembler
+# reproducing itself, and its encodings matching an independent assembler --
+# so both are checked on a machine that is not the author's, on every push.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install reference assemblers
+        # nasm builds seed (the bootstrap tool); binutils' as is the
+        # independent encoder the differential tests compare against.
+        run: sudo apt-get update -qq && sudo apt-get install -y nasm binutils
+
+      - name: Bootstrap from source
+        # nasm + seed.asm are the only trusted inputs: this rebuilds the
+        # assembler from scratch and requires the chain to converge, which
+        # also proves the committed ./v1 binary matches what source produces.
+        run: ./bootstrap.sh
+
+      - name: Full test suite
+        run: ./tests/run_all.sh
+
+      - name: Benchmark (informational)
+        run: ./tests/bench_par.sh ./v1 3 || true
