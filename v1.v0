@@ -164,7 +164,10 @@ DEFLIST_OFF     equ 0xD900000            ; 8 MiB of symbol-slot pointers, one
                                           ; 16 MiB hash table to find them
                                           ; would cost more than the work it
                                           ; just did
-MMAP_TOTAL      equ 0xE220000
+MEM_INDEX_OFF   equ 0xE220000            ; parse_mem's index register, or
+                                          ; NEG_ONE when the operand has none
+MEM_SCALE_OFF   equ 0xE220008            ; SIB scale field (0..3 = 1,2,4,8)
+MMAP_TOTAL      equ 0xE220010
 
 MAX_JOBS        equ 16
 PAR_MIN_BYTES   equ 262144               ; below ~256 KiB the fork+merge
@@ -274,6 +277,7 @@ CH_LBRACKET     equ 91
 CH_RBRACKET     equ 93
 CH_US           equ 95
 CH_a            equ 97
+CH_STAR         equ 42
 CH_BACKSLASH    equ 92
 CH_n            equ 110
 CH_r            equ 114
@@ -2895,44 +2899,99 @@ ret
 ;   out: r15 += 7 (no SIB) or 8 (base is rsp/r12)
 ; ===========================================================================
 emit_mem:
-mov rcx, 0x48
+mov rcx, 0x48                      ; REX.W
+call emit_rex_x                    ; fold in R, X and B
+movb [r15+0], rcx
+add r15, 1
+movb [r15+0], r10                  ; opcode
+add r15, 1
+call emit_modrm_sib
+ret
+
+; ===========================================================================
+; emit_rex_x -- in: rcx = REX base (0x40 or 0x48), rax = reg field,
+; rdx = base reg; out: rcx = REX with R, X and B set as needed.
+; X comes from the index register parse_mem left behind, which is why it
+; cannot simply be derived from the two register operands.
+;   clob: rsi, rdi
+; ===========================================================================
+emit_rex_x:
 mov rsi, rax
 shr rsi, 3
-shl rsi, 2
+shl rsi, 2                         ; REX.R
 add rcx, rsi
 mov rsi, rdx
-shr rsi, 3
+shr rsi, 3                         ; REX.B
 add rcx, rsi
-movb [r15+0], rcx
+mov rsi, rbx
+add rsi, MEM_INDEX_OFF
+mov rsi, [rsi+0]
+cmp rsi, NEG_ONE
+je emit_rex_x_done
+shr rsi, 3
+shl rsi, 1                         ; REX.X
+add rcx, rsi
+emit_rex_x_done:
+ret
 
-movb [r15+1], r10
-
+; ===========================================================================
+; emit_modrm_sib -- ModRM(mod=10) [+SIB] + disp32, written through r15.
+;   in: rax = reg field, rdx = base reg, r9 = disp32, plus the index and
+;       scale parse_mem stored.
+; A SIB byte is required whenever there is an index, and also when the
+; base is rsp/r12, whose low three bits (100) are the escape that means
+; "SIB follows" rather than a plain register.
+; ===========================================================================
+emit_modrm_sib:
 mov rsi, rax
 and rsi, 7
 shl rsi, 3
-add rsi, 0x80
-mov rdi, rdx
-and rdi, 7
-cmp rdi, 4
-je emit_mem_sib
-add rsi, rdi
-movb [r15+2], rsi
-mov rdi, r15
-add rdi, 3
-mov rax, r9
-call store_dword
-add r15, 7
-ret
-emit_mem_sib:
+add rsi, 0x80                      ; mod = 10 (disp32)
+mov rdi, rbx
+add rdi, MEM_INDEX_OFF
+mov rdi, [rdi+0]
+cmp rdi, NEG_ONE
+jne emit_modrm_sib_indexed
+mov rcx, rdx
+and rcx, 7
+cmp rcx, 4
+je emit_modrm_sib_basesib
+add rsi, rcx
+movb [r15+0], rsi
+add r15, 1
+jmp emit_modrm_sib_disp
+emit_modrm_sib_basesib:
 add rsi, 4
-movb [r15+2], rsi
-mov rax, 0x24
-movb [r15+3], rax
+movb [r15+0], rsi
+add r15, 1
+mov rcx, 0x24                      ; scale 0, index 100 (none), base 100
+movb [r15+0], rcx
+add r15, 1
+jmp emit_modrm_sib_disp
+
+emit_modrm_sib_indexed:
+add rsi, 4                         ; rm = 100: a SIB byte follows
+movb [r15+0], rsi
+add r15, 1
+mov rcx, rbx
+add rcx, MEM_SCALE_OFF
+mov rcx, [rcx+0]
+shl rcx, 6                         ; scale into bits 7:6
+mov rsi, rdi
+and rsi, 7
+shl rsi, 3                         ; index into bits 5:3
+add rcx, rsi
+mov rsi, rdx
+and rsi, 7                         ; base into bits 2:0
+add rcx, rsi
+movb [r15+0], rcx
+add r15, 1
+
+emit_modrm_sib_disp:
 mov rdi, r15
-add rdi, 4
 mov rax, r9
 call store_dword
-add r15, 8
+add r15, 4
 ret
 
 ; ===========================================================================
@@ -2942,46 +3001,17 @@ ret
 ;   out: r15 += 8 (no SIB) or 9 (base is rsp/r12)
 ; ===========================================================================
 emit_movb_load:
-mov rcx, 0x48
-mov rsi, rax
-shr rsi, 3
-shl rsi, 2
-add rcx, rsi
-mov rsi, rdx
-shr rsi, 3
-add rcx, rsi
+mov rcx, 0x48                      ; REX.W: destination is the full 64-bit reg
+call emit_rex_x
 movb [r15+0], rcx
+add r15, 1
 mov rcx, 15
-movb [r15+1], rcx
+movb [r15+0], rcx
+add r15, 1
 mov rcx, 0xB6
-movb [r15+2], rcx
-
-mov rsi, rax
-and rsi, 7
-shl rsi, 3
-add rsi, 0x80
-mov rdi, rdx
-and rdi, 7
-cmp rdi, 4
-je emit_movb_load_sib
-add rsi, rdi
-movb [r15+3], rsi
-mov rdi, r15
-add rdi, 4
-mov rax, r9
-call store_dword
-add r15, 8
-ret
-emit_movb_load_sib:
-add rsi, 4
-movb [r15+3], rsi
-mov rax, 0x24
-movb [r15+4], rax
-mov rdi, r15
-add rdi, 5
-mov rax, r9
-call store_dword
-add r15, 9
+movb [r15+0], rcx
+add r15, 1
+call emit_modrm_sib
 ret
 
 ; ===========================================================================
@@ -3017,46 +3047,17 @@ ret
 ;   out: r15 += 8 (no SIB) or 9 (base is rsp/r12)
 ; ===========================================================================
 emit_movw_load:
-mov rcx, 0x48
-mov rsi, rax
-shr rsi, 3
-shl rsi, 2
-add rcx, rsi
-mov rsi, rdx
-shr rsi, 3
-add rcx, rsi
+mov rcx, 0x48                      ; REX.W: destination is the full 64-bit reg
+call emit_rex_x
 movb [r15+0], rcx
+add r15, 1
 mov rcx, 15
-movb [r15+1], rcx
+movb [r15+0], rcx
+add r15, 1
 mov rcx, 0xB7
-movb [r15+2], rcx
-
-mov rsi, rax
-and rsi, 7
-shl rsi, 3
-add rsi, 0x80
-mov rdi, rdx
-and rdi, 7
-cmp rdi, 4
-je emit_movw_load_sib
-add rsi, rdi
-movb [r15+3], rsi
-mov rdi, r15
-add rdi, 4
-mov rax, r9
-call store_dword
-add r15, 8
-ret
-emit_movw_load_sib:
-add rsi, 4
-movb [r15+3], rsi
-mov rax, 0x24
-movb [r15+4], rax
-mov rdi, r15
-add rdi, 5
-mov rax, r9
-call store_dword
-add r15, 9
+movb [r15+0], rcx
+add r15, 1
+call emit_modrm_sib
 ret
 
 ; ===========================================================================
@@ -3107,50 +3108,19 @@ ret
 ; cursor rather than fixed [r15+N] slots.
 ; ===========================================================================
 emit_rex32_mem:
-mov rcx, 0x40
-mov rsi, rax
-shr rsi, 3
-shl rsi, 2
-add rcx, rsi
-mov rsi, rdx
-shr rsi, 3
-add rcx, rsi
-mov rdi, r15
+mov rcx, 0x40                      ; no REX.W: 32/16/8-bit operand
+call emit_rex_x
 cmp rcx, 0x40
 jne erm_prefix
-cmp r11, 0
+cmp r11, 0                         ; movb forces a bare REX (SPL/BPL/SIL/DIL)
 je erm_noprefix
 erm_prefix:
-movb [rdi+0], rcx
-add rdi, 1
+movb [r15+0], rcx
+add r15, 1
 erm_noprefix:
-movb [rdi+0], r10
-add rdi, 1
-
-mov rsi, rax
-and rsi, 7
-shl rsi, 3
-add rsi, 0x80                      ; mod = 10 (disp32)
-mov rcx, rdx
-and rcx, 7
-cmp rcx, 4                         ; rsp/r12 as base always needs a SIB
-je erm_sib
-add rsi, rcx
-movb [rdi+0], rsi
-add rdi, 1
-jmp erm_disp
-erm_sib:
-add rsi, 4
-movb [rdi+0], rsi
-add rdi, 1
-mov rcx, 0x24                      ; scale=0 index=none base=rm
-movb [rdi+0], rcx
-add rdi, 1
-erm_disp:
-mov rax, r9
-call store_dword
-add rdi, 4
-mov r15, rdi
+movb [r15+0], r10                  ; opcode
+add r15, 1
+call emit_modrm_sib
 ret
 
 ; ===========================================================================
@@ -3228,7 +3198,16 @@ ret
 ; parse_mem -- parses "[reg+imm]" or "[reg-imm]" at r13 (must start '[')
 ;   out: rax = base register, r9 = signed disp; r13 advanced past ']'
 ; ===========================================================================
+; Accepts [base+disp], [base-disp], and the scaled-index forms
+; [base+index*scale] and [base+index*scale+disp] (scale 1, 2, 4 or 8).
+; The index and scale are handed to the emitters through memory rather
+; than registers -- every emitter already takes three register operands,
+; and this keeps a fourth from having to thread through all of them.
 parse_mem:
+mov rax, rbx
+add rax, MEM_INDEX_OFF
+mov rcx, NEG_ONE
+mov [rax+0], rcx                 ; no index until proven otherwise
 cmp r13, r12
 jae die_bad_operand
 movb rax, [r13+0]
@@ -3238,17 +3217,81 @@ add r13, 1
 call parse_reg
 cmp rax, NEG_ONE
 je die_bad_operand
-push rax
+push rax                         ; base
 cmp r13, r12
 jae die_bad_operand
 movb rcx, [r13+0]
 cmp rcx, CH_PLUS
-je parse_mem_pos
+je parse_mem_plus
 cmp rcx, CH_MINUS
 je parse_mem_neg
 jmp die_bad_operand
-parse_mem_pos:
+
+parse_mem_plus:
+; after '+' this is either an index register or a displacement
 add r13, 1
+call parse_reg                   ; leaves r13 alone when it does not match
+cmp rax, NEG_ONE
+je parse_mem_disp_pos
+; --- index register: require *scale ---
+push rax
+cmp r13, r12
+jae die_bad_operand
+movb rcx, [r13+0]
+cmp rcx, CH_STAR
+jne die_bad_operand
+add r13, 1
+call parse_imm                   ; the scale factor itself
+mov rcx, 0                       ; encode 1,2,4,8 as SIB scale 0,1,2,3
+cmp rax, 1
+je parse_mem_scale_ok
+mov rcx, 1
+cmp rax, 2
+je parse_mem_scale_ok
+mov rcx, 2
+cmp rax, 4
+je parse_mem_scale_ok
+mov rcx, 3
+cmp rax, 8
+je parse_mem_scale_ok
+jmp die_bad_scale
+parse_mem_scale_ok:
+mov rax, rbx
+add rax, MEM_SCALE_OFF
+mov [rax+0], rcx
+pop rcx                          ; index register
+cmp rcx, 4
+je die_bad_index                 ; rsp cannot be a SIB index (100 = none)
+mov rax, rbx
+add rax, MEM_INDEX_OFF
+mov [rax+0], rcx
+; an optional displacement may follow the scaled index
+cmp r13, r12
+jae die_bad_operand
+movb rcx, [r13+0]
+cmp rcx, CH_RBRACKET
+je parse_mem_zero_disp
+cmp rcx, CH_PLUS
+je parse_mem_idx_pos
+cmp rcx, CH_MINUS
+je parse_mem_idx_neg
+jmp die_bad_operand
+parse_mem_zero_disp:
+mov rax, 0
+jmp parse_mem_haveimm
+parse_mem_idx_pos:
+add r13, 1
+call parse_imm
+jmp parse_mem_haveimm
+parse_mem_idx_neg:
+add r13, 1
+call parse_imm
+mov rdx, 0
+sub rdx, rax
+mov rax, rdx
+jmp parse_mem_haveimm
+
+parse_mem_disp_pos:
 call parse_imm
 jmp parse_mem_haveimm
 parse_mem_neg:
@@ -4582,6 +4625,12 @@ jmp die_at_line
 die_bad_escape:
 mov rdi, msg_badescape
 jmp die_at_line
+die_bad_scale:
+mov rdi, msg_badscale
+jmp die_at_line
+die_bad_index:
+mov rdi, msg_badindex
+jmp die_at_line
 die_disp_range:
 mov rdi, msg_disprange
 jmp die_at_line
@@ -4746,6 +4795,12 @@ db "v1: immediate out of range"
 db 0
 msg_badescape:
 db "v1: unknown escape sequence in string"
+db 0
+msg_badscale:
+db "v1: index scale must be 1, 2, 4 or 8"
+db 0
+msg_badindex:
+db "v1: rsp cannot be used as an index register"
 db 0
 msg_chunk_too_big:
 db "v1: parallel chunk exceeded its slot; retry with fewer jobs"

@@ -44,6 +44,9 @@ echo "=== function-pointer dispatch (dq label + call reg) ==="
 echo "=== db string escapes ==="
 ./tests/check_escapes.sh "$V" || fail=1
 
+echo "=== scaled-index addressing ==="
+./tests/check_scaled.sh "$V" || fail=1
+
 echo "=== range / overflow regressions ==="
 ./tests/regress_range.sh "$V"
 

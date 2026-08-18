@@ -30,6 +30,12 @@
 	mov dword ptr [rdx+7000], r10d
 	mov r15d, dword ptr [r12+600]
 	lea rax, [rbx+8000]
+	mov rax, [rbx+rcx*8+2000]
+	mov [rdx+rsi*4+3000], r9
+	mov r10, [r8+r11*2+400]
+	movzx rax, byte ptr [rcx+rdx*1+600]
+	mov r15d, dword ptr [r12+r13*8+700]
+	lea rbx, [rax+rax*4+16000]
 	lea r12, [r13+9000]
 	imul rax, rcx
 	imul r8, r9
