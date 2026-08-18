@@ -33,22 +33,32 @@
 ; currently active, see .text/.data below) matches seed's, kept for
 ; familiarity -- not required by the dialect itself.
 ;
-; Currently supported: mov (imm64/reg/load/store/label-or-const) / movb
-; movw movd (8/16/32-bit load(+zero-extend)/store, mirroring movb; movd's
-; load needs no explicit zero-extend opcode -- any 32-bit register write
-; already clears the upper 32 bits in long mode) / lea / imul (reg,reg
-; only, no imm form) / add sub and or xor cmp test (reg,reg and reg,imm
-; for the arithmetic ones -- test is reg,reg only -- imm may be negative)
-; / neg / shl shr (imm8 or const, unsigned only) / push pop / jmp je jne
-; jl jae call / ret / syscall / db (string or byte, byte value unsigned
-; only) / equ (value must be a non-negative literal; may be referenced
-; before its definition by `mov reg, NAME`, but not by an arithmetic
-; operand, which resolves constants immediately) / labels / .text /.data
-; (switches which buffer subsequent statements append to; defaults to
-; .text, so source that never mentions either -- everything written
-; before this feature existed -- behaves unchanged). Also takes filenames
-; as argv[1]/argv[2] (output gets mode 0755), falling back to
-; stdin/stdout when either is omitted.
+; Currently supported:
+;   mov      imm64 / reg / load / store / label-or-const
+;   movb movw movd   8/16/32-bit load (zero-extended) and store; movd's
+;            load needs no explicit zero-extend opcode, since any 32-bit
+;            register write already clears the upper half in long mode
+;   lea, imul (reg,reg and reg,imm), neg
+;   add sub and or xor cmp test   reg,reg and reg,imm; immediates may be
+;            negative and are range-checked, never truncated
+;   shl shr  imm8 or constant, unsigned
+;   push pop, jmp je jne jl jae, call (label or register), ret, syscall
+;   db       string with \n \t \r \0 \\ \" escapes, or a single byte
+;   dw dd dq 2/4/8-byte values; dq also takes a label, which is what
+;            makes a jump table expressible
+;   resb     reserve N bytes, .bss only
+;   equ      compile-time constant; may be referenced before its
+;            definition by `mov reg, NAME`, but not by an arithmetic
+;            operand, which resolves constants immediately
+;   labels, and memory operands [base+disp] and [base+index*scale+disp]
+;   .text .data .bss   choose which buffer statements append to; .text is
+;            the default, so source that mentions none of them behaves
+;            exactly as it did before sections existed
+;   %include "file"    spliced in textually before parsing; nests
+;
+; Invocation: filenames as argv[1]/argv[2] (the output gets mode 0755),
+; each falling back to stdin/stdout, and argv[3] as a worker count for
+; parallel assembly.
 ;
 ; Range checking: values that cannot fit the field they are headed for
 ; are hard errors ("immediate out of range", "displacement out of
@@ -59,16 +69,24 @@
 ; point, which is the single worst failure mode an assembler has.
 ;
 ; NOT implemented, i.e. what "grow the dialect further" still means here:
-; imul reg,imm, test reg,imm, .bss (no uninitialized-space directive;
-; write explicit zero bytes into .data instead), arithmetic at anything
-; but 64 bits (movw/movd cover memory access; add/sub/cmp/etc are still
-; always full-width), scaled-index / RIP-relative addressing, short
-; (rel8) jump encoding, escape sequences in db strings ("\n" is a
-; literal backslash followed by n -- emit byte 10 with `db 10` instead).
-; Mnemonic dispatch
-; is SWAR (masked-qword compare, see PACK_* below) + bucketed by first
-; letter; a real function-pointer table would need `dq label` support
-; this dialect still doesn't have.
+; arithmetic at widths other than 64-bit (movb/movw/movd cover memory
+; access, but add/sub/cmp and friends are always full-width);
+; RIP-relative addressing; the remaining jcc conditions (jg/jle/jb/ja/
+; jbe/jge -- reachable by swapping operands or shifting a threshold by
+; one, which is what this file does throughout); and short (rel8) jump
+; encoding.
+;
+; rel8 is a deliberate omission rather than a missing feature. Choosing
+; it requires knowing whether the target is within 127 bytes, which is
+; not known when the instruction is emitted, so it needs a relaxation
+; loop: shrink a jump, watch every later address move, repeat until
+; nothing changes. That is precisely what the single-pass design trades
+; away -- every instruction's length is final the moment it is written,
+; which is why forward references need no second parse. It belongs
+; behind an explicit optimisation flag, not in the default path.
+;
+; Mnemonic dispatch is SWAR (a masked-qword compare, see PACK_* below)
+; bucketed by first letter.
 ; ===========================================================================
 
 ; --- syscall numbers / mmap flags ---

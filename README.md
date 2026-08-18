@@ -67,19 +67,33 @@ documented at the top of `v1.v0` — that comment is kept up to date as
 the dialect grows, so it's the source of truth, not this file. Briefly:
 
 - `mov`/`movb`/`movw`/`movd` (64/8/16/32-bit, register/immediate/memory,
-  label addresses), `lea`, `imul` (reg,reg)
-- `add sub and or xor cmp test` (reg,reg and reg,imm — `test` is
-  reg,reg only — immediates may be negative), `neg`, `shl shr`
-- `push pop`, `jmp je jne jl jae call ret syscall`
-- `db` (string or byte literal), `equ` (compile-time constants),
-  `label:` definitions, `.text`/`.data` (real ELF sections — separate
-  R+X and R `PT_LOAD` segments, not one flat blob)
-- filenames as argv[1]/argv[2] (falls back to stdin/stdout)
+  label addresses), `lea`, `imul`, `neg`
+- `add sub and or xor cmp test` (reg,reg and reg,imm; immediates may be
+  negative and are range-checked), `shl shr`
+- `push pop`, `jmp je jne jl jae`, `call` (label *or* register), `ret`,
+  `syscall`
+- `db` with `\n \t \r \0 \\ \"` escapes, `dw`/`dd`/`dq` — and `dq label`,
+  which together with `call reg` makes a function-pointer dispatch table
+  expressible
+- `equ` constants, `label:` definitions, `resb`
+- memory operands `[base+disp]` and `[base+index*scale+disp]`
+- `.text`/`.data`/`.bss` — real ELF segments: R+X, R, and a
+  zero-filled RW mapping that costs nothing in the file
+- `%include "file"`, nesting supported
+- filenames as argv[1]/argv[2], worker count as argv[3]
 
-Not yet implemented: `imul reg,imm`, `test reg,imm`, `.bss`, arithmetic
-narrower than 64 bits (memory access has `movb`/`movw`/`movd`; the ALU
-ops don't), scaled-index or RIP-relative addressing, short (`rel8`) jump
-encoding.
+Not yet implemented: arithmetic at widths other than 64-bit (memory
+access has `movb`/`movw`/`movd`; the ALU ops are always full-width),
+RIP-relative addressing, the remaining `jcc` conditions, and short
+(`rel8`) jumps.
+
+`rel8` is a deliberate omission. Picking it requires knowing whether the
+target is within 127 bytes, which isn't known when the instruction is
+emitted — so it needs a relaxation loop: shrink a jump, watch every later
+address shift, repeat to a fixed point. That is exactly what the
+single-pass design trades away, and it's why forward references need no
+second parse. It belongs behind an optimisation flag, not in the default
+path.
 
 ## Parallel assembly
 
@@ -161,14 +175,25 @@ were found in the first place.
 
 A wrong encoding that still runs is the worst thing an assembler can do,
 so values that don't fit their target field are hard errors with a line
-number, never silent truncation:
+and column, never silent truncation:
 
 ```
 $ printf 'add rax, 0x123456789\n' | ./v1
-v1: immediate out of range at line 1
+v1: immediate out of range at line 1 col 21
 ```
 
-The same applies to memory displacements wider than `disp32` and to
-integer literals that overflow 64 bits. Every error path exits nonzero
-with a distinct message on stderr — there are no assertion failures or
-segfaults on malformed input.
+The same applies to memory displacements wider than `disp32`, integer
+literals that overflow 64 bits, unknown string escapes, and bad index
+scales. An undefined label names the symbol instead of a position, since
+it is only discovered once the whole file has been scanned:
+
+```
+v1: undefined label: nowhere_at_all
+```
+
+Every error path exits nonzero with a distinct message on stderr — there
+are no assertion failures or segfaults on malformed input.
+
+The differential test against GNU `as` is what backs this up: it has
+caught real defects more than once, including a redundant REX prefix on
+every low-register `movd`/`movw`, found the day it was reconnected.
