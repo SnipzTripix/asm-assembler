@@ -51,12 +51,8 @@ echo "=== cross-chunk references ==="
 echo "=== self-hosting fixed point ==="
 ./tests/fixedpoint.sh "$V" || fail=1
 
-echo "=== nasm differential ==="
-if command -v nasm >/dev/null 2>&1; then
-    ./tests/run_difftest.sh || fail=1
-else
-    echo "skipped (nasm not installed)"
-fi
+echo "=== differential vs an independent assembler ==="
+./tests/run_difftest.sh || fail=1
 
 echo
 if [ $fail -eq 0 ]; then

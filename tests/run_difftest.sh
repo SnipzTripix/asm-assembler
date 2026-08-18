@@ -1,77 +1,73 @@
 #!/usr/bin/env bash
-# run_difftest.sh -- differential test: assemble our .v0 sources with our
-# assembler(s) and the matching nasm .asm reference, compare code bytes.
+# run_difftest.sh -- differential test: assemble the same instruction
+# sequence with our assembler and with an independent reference
+# assembler, then compare the code bytes.
 #
-#   v1 (top-level, the current canonical assembler) is checked against
-#   tests/v1difftest.v0 -- the instruction set v1's dialect supports
-#   (je/jne/jl/jae only, plus lea/imul which v1 has and seed doesn't).
+# The reference is GNU as (the project spec accepts NASM or GAS); its
+# .text section is extracted with objcopy so no headers or layout
+# assumptions enter the comparison. nasm is used instead when present,
+# for the seed test, whose reference predates the GAS conversion.
 #
-#   seed/seed (retired bootstrap tool, kept for the historical record) is
-#   checked against tests/difftest.v0 -- seed's larger jcc set (also
-#   jge/jg/jle/jb/ja/jbe), no lea/imul.
+# Each source/reference pair is written one instruction per line in
+# lockstep, so a mismatch at byte N points at roughly the Nth
+# instruction in both files.
 #
-# Each source/reference pair is written in lockstep, one instruction per
-# line, so a byte mismatch at offset N points at roughly the Nth
-# instruction in both files for easy triage.
-#
-# Immediate values, memory displacements, and jump distances are all
-# deliberately chosen so nasm can't take one of its automatic shorter
-# encodings (32-bit mov, disp8, imm8, accumulator-specific opcodes, rel8
-# jumps) that our encoder never uses -- see the comments at the top of
-# each _ref.asm file. Byte-identical output under those constraints is
-# the real correctness signal; it does not mean our encoder is as
-# compact as nasm's for arbitrary source (it deliberately isn't).
+# Immediates, displacements and jump distances are deliberately chosen
+# so the reference cannot pick a shorter encoding than ours (no imm8, no
+# disp8, no rel8, no accumulator-specific opcodes). Byte-identical output
+# under those constraints is the correctness signal; it does not claim
+# our encoder is as compact as a mature one for arbitrary input.
 cd "$(dirname "$0")/.."
-
-if ! command -v nasm >/dev/null 2>&1; then
-    echo "run_difftest: nasm not found on PATH" >&2
-    exit 1
-fi
-
+status=0
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-status=0
 
-check_one() {
-    local name="$1" bin="$2" v0="$3" ref="$4" hdr_len="$5"
-    if [ ! -x "$bin" ]; then
-        echo "run_difftest: $bin not found or not executable, skipping $name" >&2
-        return
+# --- v1 against GNU as ---
+if command -v as >/dev/null 2>&1 && command -v objcopy >/dev/null 2>&1; then
+    if [ -x ./v1 ]; then
+        as -o "$tmp/ref.o" tests/v1difftest_ref.s 2>"$tmp/as.err"
+        if [ $? -ne 0 ]; then
+            echo "run_difftest: as failed:" >&2; cat "$tmp/as.err" >&2; status=1
+        else
+            objcopy -O binary --only-section=.text "$tmp/ref.o" "$tmp/ref.bin"
+            ./v1 tests/v1difftest.v0 "$tmp/v1.bin" 2>"$tmp/v1.err"
+            if [ $? -ne 0 ]; then
+                echo "run_difftest: v1 failed:" >&2; cat "$tmp/v1.err" >&2; status=1
+            else
+                n=$(wc -c < "$tmp/ref.bin")
+                tail -c +177 "$tmp/v1.bin" | head -c "$n" > "$tmp/v1.code.bin"
+                if cmp -s "$tmp/v1.code.bin" "$tmp/ref.bin"; then
+                    echo "PASS: v1 matches GNU as byte-for-byte ($n bytes)"
+                else
+                    echo "FAIL: v1 differs from GNU as" >&2
+                    cmp -l "$tmp/v1.code.bin" "$tmp/ref.bin" | head -8 >&2
+                    echo "  (ours / reference, byte offsets are 1-based)" >&2
+                    status=1
+                fi
+            fi
+        fi
     fi
+else
+    echo "skipped v1: GNU as/objcopy not installed"
+fi
 
-    nasm -f bin "$ref" -o "$tmp/$name.nasm.bin" 2>"$tmp/$name.nasm.err"
+# --- seed against nasm, if nasm happens to be available ---
+if command -v nasm >/dev/null 2>&1 && [ -x ./seed/seed ]; then
+    nasm -f bin tests/difftest_ref.asm -o "$tmp/snasm.bin" 2>"$tmp/n.err"
     if [ $? -ne 0 ]; then
-        echo "run_difftest: nasm failed to assemble $ref:" >&2
-        cat "$tmp/$name.nasm.err" >&2
-        status=1
-        return
-    fi
-
-    "$bin" < "$v0" > "$tmp/$name.bin" 2>"$tmp/$name.err"
-    if [ $? -ne 0 ]; then
-        echo "run_difftest: $name failed to assemble $v0:" >&2
-        cat "$tmp/$name.err" >&2
-        status=1
-        return
-    fi
-
-    # Strip the ELF header, then compare only the first N bytes (N =
-    # nasm's own output length): v1's output may have trailing
-    # page-alignment padding before an (empty, in these tests) .data
-    # PT_LOAD that nasm's raw -f bin output never has, so an exact
-    # whole-file cmp would spuriously fail on that padding alone.
-    n=$(wc -c < "$tmp/$name.nasm.bin")
-    tail -c +$((hdr_len + 1)) "$tmp/$name.bin" | head -c "$n" > "$tmp/$name.code.bin"
-    if cmp -s "$tmp/$name.code.bin" "$tmp/$name.nasm.bin"; then
-        echo "PASS: $name's encoding matches nasm byte-for-byte ($n bytes)"
+        echo "run_difftest: nasm failed:" >&2; cat "$tmp/n.err" >&2; status=1
     else
-        echo "FAIL: $name's encoding differs from nasm" >&2
-        cmp "$tmp/$name.code.bin" "$tmp/$name.nasm.bin" >&2 || true
-        status=1
+        ./seed/seed < tests/difftest.v0 > "$tmp/seed.bin" 2>"$tmp/s.err"
+        n=$(wc -c < "$tmp/snasm.bin")
+        tail -c +121 "$tmp/seed.bin" | head -c "$n" > "$tmp/seed.code.bin"
+        if cmp -s "$tmp/seed.code.bin" "$tmp/snasm.bin"; then
+            echo "PASS: seed matches nasm byte-for-byte ($n bytes)"
+        else
+            echo "FAIL: seed differs from nasm" >&2; status=1
+        fi
     fi
-}
-
-check_one v1   ./v1        tests/v1difftest.v0 tests/v1difftest_ref.asm 176
-check_one seed ./seed/seed tests/difftest.v0    tests/difftest_ref.asm  120
+else
+    echo "skipped seed: nasm not installed (seed is archived; v1 is the live check)"
+fi
 
 exit $status

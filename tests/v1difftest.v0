@@ -1,7 +1,12 @@
-; v1difftest.v0 -- instruction forms v1's dialect supports (subset of
-; seed/v0.2's jcc set: je/jne/jl/jae only), plus lea/imul which v1 has
-; and seed doesn't. Compared byte-for-byte against v1difftest_ref.asm
-; assembled by nasm (see tests/run_difftest.sh).
+; v1difftest.v0 -- one of every instruction form v1's dialect supports,
+; with low and high registers wherever REX bits are what's being checked.
+; Compared byte-for-byte against tests/v1difftest_ref.s assembled by GNU
+; as (see tests/run_difftest.sh).
+;
+; Immediates, displacements and jump distances are deliberately chosen so
+; the reference assembler cannot pick a shorter encoding than ours: no
+; value fits imm8 or disp8, none of the accumulator-specific opcode forms
+; apply, and the jump targets sit far enough away to force rel32.
 mov rax, 0x123456789ABCDEF0
 mov r15, 0xFEDCBA9876543210
 mov rax, rbx
@@ -15,10 +20,20 @@ movb rax, [rcx+6000]
 movb [rdx+7000], r10
 movb r15, [rbp+500]
 movb [r12+600], r8
+movw rax, [rcx+6000]
+movw [rdx+7000], r10
+movw r15, [rbp+500]
+movd rax, [rcx+6000]
+movd [rdx+7000], r10
+movd r15, [r12+600]
 lea rax, [rbx+8000]
 lea r12, [r13+9000]
 imul rax, rcx
 imul r8, r9
+test rax, rbx
+test r8, r9
+neg rax
+neg r13
 add rax, rbx
 add r12, r13
 add rcx, 1000
@@ -54,6 +69,16 @@ jae target1
 call target1
 syscall
 ret
+add rax, rbx
+add rax, rbx
+add rax, rbx
+add rax, rbx
+add rax, rbx
+add rax, rbx
+add rax, rbx
+add rax, rbx
+add rax, rbx
+add rax, rbx
 add rax, rbx
 add rax, rbx
 add rax, rbx

@@ -2985,44 +2985,20 @@ ret
 ;   out: r15 += 7 (no SIB) or 8 (base is rsp/r12)
 ; ===========================================================================
 emit_movb_store:
-mov rcx, 0x40
-mov rsi, rax
-shr rsi, 3
-shl rsi, 2
-add rcx, rsi
-mov rsi, rdx
-shr rsi, 3
-add rcx, rsi
-movb [r15+0], rcx
-mov rcx, 0x88
-movb [r15+1], rcx
-
-mov rsi, rax
-and rsi, 7
-shl rsi, 3
-add rsi, 0x80
-mov rdi, rdx
-and rdi, 7
-cmp rdi, 4
-je emit_movb_store_sib
-add rsi, rdi
-movb [r15+2], rsi
-mov rdi, r15
-add rdi, 3
-mov rax, r9
-call store_dword
-add r15, 7
-ret
-emit_movb_store_sib:
-add rsi, 4
-movb [r15+2], rsi
-mov rax, 0x24
-movb [r15+3], rax
-mov rdi, r15
-add rdi, 4
-mov rax, r9
-call store_dword
-add r15, 8
+; Unlike the 16/32-bit stores, this one sometimes needs a REX prefix that
+; carries no bits at all: source registers 4..7 mean AH/CH/DH/BH without
+; REX and SPL/BPL/SIL/DIL with it, and we always want the latter. Hence
+; the force flag -- REX still has to carry its R/B bits when the operands
+; are extended, so it cannot simply be written out as a bare 0x40 here.
+mov r11, 0
+cmp rax, 4
+jl emit_movb_store_go
+cmp rax, 8
+jae emit_movb_store_go
+mov r11, 1
+emit_movb_store_go:
+mov r10, 0x88
+call emit_rex32_mem
 ret
 
 ; ===========================================================================
@@ -3086,46 +3062,12 @@ ret
 ;   out: r15 += 8 (no SIB) or 9 (base is rsp/r12)
 ; ===========================================================================
 emit_movw_store:
-mov rcx, 0x66
-movb [r15+0], rcx
-mov rcx, 0x40
-mov rsi, rax
-shr rsi, 3
-shl rsi, 2
-add rcx, rsi
-mov rsi, rdx
-shr rsi, 3
-add rcx, rsi
-movb [r15+1], rcx
-mov rcx, 0x89
-movb [r15+2], rcx
-
-mov rsi, rax
-and rsi, 7
-shl rsi, 3
-add rsi, 0x80
-mov rdi, rdx
-and rdi, 7
-cmp rdi, 4
-je emit_movw_store_sib
-add rsi, rdi
-movb [r15+3], rsi
-mov rdi, r15
-add rdi, 4
-mov rax, r9
-call store_dword
-add r15, 8
-ret
-emit_movw_store_sib:
-add rsi, 4
-movb [r15+3], rsi
-mov rax, 0x24
-movb [r15+4], rax
-mov rdi, r15
-add rdi, 5
-mov rax, r9
-call store_dword
-add r15, 9
+mov rcx, 0x66                      ; operand-size override, then the same
+movb [r15+0], rcx                  ; body the 32-bit store uses
+add r15, 1
+mov r10, 0x89
+mov r11, 0
+call emit_rex32_mem
 ret
 
 ; ===========================================================================
@@ -3138,6 +3080,26 @@ ret
 ;   out: r15 += 7 (no SIB) or 8 (base is rsp/r12)
 ; ===========================================================================
 emit_movd_load:
+mov r10, 0x8B
+mov r11, 0
+call emit_rex32_mem
+ret
+
+; ===========================================================================
+; emit_rex32_mem -- shared body for the 32-bit memory forms (and, with a
+; 0x66 already emitted, the 16-bit stores): optional REX, one opcode
+; byte, ModRM(mod=10)[+SIB], disp32.
+;   in: r10 = opcode, rax = reg field, rdx = base reg, r9 = disp32,
+;       r11 = 1 to emit REX even when it carries no bits (movb only)
+;
+; A 32-bit operand needs no REX.W, so REX appears only when an extended
+; register forces it. Emitting 0x40 unconditionally -- which this used to
+; do -- is a legal but pointless prefix that no reference assembler
+; produces, and the differential test against GNU as flagged every one of
+; them. Because the length now varies, the bytes go out through a moving
+; cursor rather than fixed [r15+N] slots.
+; ===========================================================================
+emit_rex32_mem:
 mov rcx, 0x40
 mov rsi, rax
 shr rsi, 3
@@ -3146,36 +3108,42 @@ add rcx, rsi
 mov rsi, rdx
 shr rsi, 3
 add rcx, rsi
-movb [r15+0], rcx
-mov rcx, 0x8B
-movb [r15+1], rcx
+mov rdi, r15
+cmp rcx, 0x40
+jne erm_prefix
+cmp r11, 0
+je erm_noprefix
+erm_prefix:
+movb [rdi+0], rcx
+add rdi, 1
+erm_noprefix:
+movb [rdi+0], r10
+add rdi, 1
 
 mov rsi, rax
 and rsi, 7
 shl rsi, 3
-add rsi, 0x80
-mov rdi, rdx
-and rdi, 7
-cmp rdi, 4
-je emit_movd_load_sib
-add rsi, rdi
-movb [r15+2], rsi
-mov rdi, r15
-add rdi, 3
-mov rax, r9
-call store_dword
-add r15, 7
-ret
-emit_movd_load_sib:
+add rsi, 0x80                      ; mod = 10 (disp32)
+mov rcx, rdx
+and rcx, 7
+cmp rcx, 4                         ; rsp/r12 as base always needs a SIB
+je erm_sib
+add rsi, rcx
+movb [rdi+0], rsi
+add rdi, 1
+jmp erm_disp
+erm_sib:
 add rsi, 4
-movb [r15+2], rsi
-mov rax, 0x24
-movb [r15+3], rax
-mov rdi, r15
-add rdi, 4
+movb [rdi+0], rsi
+add rdi, 1
+mov rcx, 0x24                      ; scale=0 index=none base=rm
+movb [rdi+0], rcx
+add rdi, 1
+erm_disp:
 mov rax, r9
 call store_dword
-add r15, 8
+add rdi, 4
+mov r15, rdi
 ret
 
 ; ===========================================================================
@@ -3185,44 +3153,9 @@ ret
 ;   out: r15 += 7 (no SIB) or 8 (base is rsp/r12)
 ; ===========================================================================
 emit_movd_store:
-mov rcx, 0x40
-mov rsi, rax
-shr rsi, 3
-shl rsi, 2
-add rcx, rsi
-mov rsi, rdx
-shr rsi, 3
-add rcx, rsi
-movb [r15+0], rcx
-mov rcx, 0x89
-movb [r15+1], rcx
-
-mov rsi, rax
-and rsi, 7
-shl rsi, 3
-add rsi, 0x80
-mov rdi, rdx
-and rdi, 7
-cmp rdi, 4
-je emit_movd_store_sib
-add rsi, rdi
-movb [r15+2], rsi
-mov rdi, r15
-add rdi, 3
-mov rax, r9
-call store_dword
-add r15, 7
-ret
-emit_movd_store_sib:
-add rsi, 4
-movb [r15+2], rsi
-mov rax, 0x24
-movb [r15+3], rax
-mov rdi, r15
-add rdi, 4
-mov rax, r9
-call store_dword
-add r15, 8
+mov r10, 0x89
+mov r11, 0
+call emit_rex32_mem
 ret
 
 ; ===========================================================================
