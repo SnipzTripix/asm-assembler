@@ -47,6 +47,9 @@ echo "=== db string escapes ==="
 echo "=== scaled-index addressing ==="
 ./tests/check_scaled.sh "$V" || fail=1
 
+echo "=== .bss / resb ==="
+./tests/check_bss.sh "$V" || fail=1
+
 echo "=== range / overflow regressions ==="
 ./tests/regress_range.sh "$V"
 

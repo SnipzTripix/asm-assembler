@@ -1,0 +1,51 @@
+; bss.v0 -- .bss reserves a megabyte that the kernel zero-fills at load
+; time and that costs nothing in the file. Writes through it, reads back,
+; and checks it started out zeroed. Exits 42.
+.text
+mov r12, buf
+
+; the kernel must have zeroed it
+mov rax, [r12+0]
+cmp rax, 0
+jne bad
+mov rax, [r12+900000]
+cmp rax, 0
+jne bad
+
+; write near both ends and read back
+mov rax, 0x1122334455667788
+mov [r12+0], rax
+mov rcx, 4242
+mov [r12+900000], rcx
+
+mov rax, [r12+0]
+mov rdx, 0x1122334455667788
+cmp rax, rdx
+jne bad
+mov rax, [r12+900000]
+mov rdx, 4242
+cmp rax, rdx
+jne bad
+
+; a .data value still works alongside it
+mov rax, marker
+mov rcx, [rax+0]
+mov rdx, 7
+cmp rcx, rdx
+jne bad
+
+mov rdi, 42
+mov rax, 60
+syscall
+bad:
+mov rdi, 1
+mov rax, 60
+syscall
+
+.data
+marker:
+dq 7
+
+.bss
+buf:
+resb 1048576

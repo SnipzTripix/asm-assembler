@@ -35,7 +35,7 @@ if command -v as >/dev/null 2>&1 && command -v objcopy >/dev/null 2>&1; then
                 echo "run_difftest: v1 failed:" >&2; cat "$tmp/v1.err" >&2; status=1
             else
                 n=$(wc -c < "$tmp/ref.bin")
-                tail -c +177 "$tmp/v1.bin" | head -c "$n" > "$tmp/v1.code.bin"
+                tail -c +233 "$tmp/v1.bin" | head -c "$n" > "$tmp/v1.code.bin"
                 if cmp -s "$tmp/v1.code.bin" "$tmp/ref.bin"; then
                     echo "PASS: v1 matches GNU as byte-for-byte ($n bytes)"
                 else

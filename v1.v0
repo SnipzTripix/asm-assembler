@@ -167,7 +167,18 @@ DEFLIST_OFF     equ 0xD900000            ; 8 MiB of symbol-slot pointers, one
 MEM_INDEX_OFF   equ 0xE220000            ; parse_mem's index register, or
                                           ; NEG_ONE when the operand has none
 MEM_SCALE_OFF   equ 0xE220008            ; SIB scale field (0..3 = 1,2,4,8)
-MMAP_TOTAL      equ 0xE220010
+SAVED_BSS_R15_OFF equ 0xE220010          ; .bss cursor while inactive
+BSS_VADDR_OFF   equ 0xE220018            ; where .bss lands in memory,
+                                          ; relative to LOAD_BASE
+MMAP_TOTAL      equ 0x12230000           ; through the end of BSSBUF
+
+; .bss gets a real buffer like the other sections, so r15 and every label
+; and emitter work there unchanged -- it simply never reaches the output
+; file. resb only moves the cursor and writes nothing, so these pages are
+; never touched and cost no memory either.
+BSSBUF_OFF      equ 0xE230000
+BSSBUF_CAP      equ 0x4000000
+MMAP_END        equ 0x12230000           ; BSSBUF_OFF + BSSBUF_CAP
 
 MAX_JOBS        equ 16
 PAR_MIN_BYTES   equ 262144               ; below ~256 KiB the fork+merge
@@ -205,9 +216,11 @@ SSYM_ENT        equ 64                   ; {name_ptr, name_len, value, section,
                                           ;  so the parent never re-runs FNV
 SFIX_ENT        equ 48                   ; {patch_off, patch_sec, kind,
                                           ;  name_ptr, name_len, target_hash}
-HDR_LEN         equ 176                  ; Ehdr(64) + 2 * Phdr(56) -- one
-                                         ; PT_LOAD each for text (R+X) and
-                                         ; data (R)
+HDR_LEN         equ 232                  ; Ehdr(64) + 3 * Phdr(56): text,
+                                         ; data and bss. Constant even when
+                                         ; a section is unused -- text
+                                         ; offsets are fixed at parse time,
+                                         ; long before the sizes are known.
 PAGE_SIZE       equ 0x1000
 PAGE_MASK       equ 0xFFFFFFFFFFFFF000   ; low32 0xFFFFF000 sign-extends
                                          ; back to this exact 64-bit
@@ -226,6 +239,10 @@ SYM_CAP         equ 262144              ; power of 2 -- and'd, never mod'd
 SYM_CAP_MASK    equ 262143
 SEC_TEXT        equ 0
 SEC_DATA        equ 1
+SEC_BSS         equ 2                    ; reserved space: occupies memory
+                                          ; at run time but no bytes in the
+                                          ; file, so a big zeroed buffer
+                                          ; costs nothing on disk
 SYM_POP_MAX     equ 229376              ; 7/8 of SYM_CAP -- open addressing
                                          ; degrades well before 100% full,
                                          ; and refusing new symbols past
@@ -321,6 +338,8 @@ PACK_NEG        equ 0x67656E
 PACK_DW         equ 0x7764
 PACK_DD         equ 0x6464
 PACK_DQ         equ 0x7164
+PACK_BSS        equ 0x737362
+PACK_RESB       equ 0x62736572
 
 ; ===========================================================================
 ; entry point -- mmap the working set, read all of stdin, parse, resolve
@@ -518,6 +537,11 @@ add rax, SAVED_DATA_R15_OFF
 mov rcx, rbx
 add rcx, DATABUF_OFF
 mov [rax+0], rcx
+mov rax, rbx
+add rax, SAVED_BSS_R15_OFF
+mov rcx, rbx
+add rcx, BSSBUF_OFF
+mov [rax+0], rcx
 
 ; --- fork out to the parallel driver when more than one worker was asked
 ; for. par_assemble returns only in the parent, with everything merged and
@@ -661,12 +685,25 @@ mov rcx, 0
 movb [r14+53], rcx
 mov rcx, 56
 movb [r14+54], rcx
-mov rcx, 2                          ; e_phnum: two segments, unless .data
-cmp rdi, 0                          ; is empty -- then the second PT_LOAD
-jne phnum_two                       ; would describe a zero-length mapping
-mov rcx, 1                          ; and the file would be padded out to a
-phnum_two:                          ; page boundary for nothing (a 1-line
-movb [r14+56], rcx                  ; program used to emit 4096 bytes)
+; e_phnum: only describe segments that exist. An empty .data would
+; otherwise be a zero-length mapping and would pad the file out to a page
+; boundary for nothing (a one-line program used to emit 4096 bytes), and
+; an empty .bss likewise.
+mov r8, rbx
+add r8, SAVED_BSS_R15_OFF
+mov r8, [r8+0]
+mov r9, rbx
+add r9, BSSBUF_OFF
+sub r8, r9                          ; r8 = bss size, kept for the phdr below
+mov rcx, 1
+cmp rdi, 0
+je phnum_have
+mov rcx, 2
+cmp r8, 0
+je phnum_have
+mov rcx, 3
+phnum_have:
+movb [r14+56], rcx
 mov rcx, 0
 movb [r14+57], rcx
 movb [r14+58], rcx
@@ -723,6 +760,37 @@ mov [r14+152], rdi                  ; p_filesz = data_size
 mov [r14+160], rdi                  ; p_memsz
 mov rcx, 4096
 mov [r14+168], rcx                  ; p_align
+
+; Phdr #3: bss, R+W, no file content at all -- p_filesz 0 and p_memsz the
+; reserved size, which is the whole point: the kernel zero-fills it.
+mov rcx, 1
+movb [r14+176], rcx
+mov rcx, 0
+movb [r14+177], rcx
+movb [r14+178], rcx
+movb [r14+179], rcx
+mov rcx, 6                          ; PF_R|PF_W -- reserved space is writable
+movb [r14+180], rcx
+mov rcx, 0
+movb [r14+181], rcx
+movb [r14+182], rcx
+movb [r14+183], rcx
+
+mov rcx, rax
+add rcx, rdi                        ; sits just past .data in the file, but
+mov [r14+184], rcx                  ; contributes no bytes to it
+mov r9, rbx
+add r9, BSS_VADDR_OFF
+mov r9, [r9+0]
+mov rcx, LOAD_BASE
+add rcx, r9
+mov [r14+192], rcx                  ; p_vaddr
+mov [r14+200], rcx                  ; p_paddr
+mov rcx, 0
+mov [r14+208], rcx                  ; p_filesz = 0: nothing on disk
+mov [r14+216], r8                   ; p_memsz  = reserved size
+mov rcx, 4096
+mov [r14+224], rcx                  ; p_align
 
 ; --- write the output image: header+text, then zero padding up to the
 ; page boundary (sourced from r14 past text_size, which is guaranteed
@@ -1256,8 +1324,14 @@ add rax, CUR_SECTION_OFF
 mov rdx, [rax+0]
 cmp rdx, SEC_TEXT
 je section_base_text
+cmp rdx, SEC_BSS
+je section_base_bss
 mov rax, rbx
 add rax, DATABUF_OFF
+ret
+section_base_bss:
+mov rax, rbx
+add rax, BSSBUF_OFF
 ret
 section_base_text:
 mov rax, r14
@@ -1475,16 +1549,8 @@ ret
 resolve_fixups:
 mov rax, rbx
 add rax, CUR_SECTION_OFF
-mov rcx, [rax+0]
-cmp rcx, SEC_TEXT
-je rf_save_text
-mov rax, rbx
-add rax, SAVED_DATA_R15_OFF
-mov [rax+0], r15
-jmp rf_sizes
-rf_save_text:
-mov rax, rbx
-add rax, SAVED_TEXT_R15_OFF
+mov rdx, [rax+0]
+call sec_cursor_slot               ; park whichever cursor is live
 mov [rax+0], r15
 rf_sizes:
 mov rax, rbx
@@ -1499,6 +1565,7 @@ and rax, rcx                        ; round up to a page -- text and data
 mov rcx, rbx
 add rcx, DATA_FILE_START_OFF
 mov [rcx+0], rax
+call compute_bss_vaddr
 
 ; --- per-fixup resolution. Every value below stays in a fixed register
 ; for the whole iteration (verified against every intervening write, not
@@ -1534,22 +1601,29 @@ je die_undef_label
 mov r11, [rsi+24]                   ; symbol value (relative) -> target
 mov rsi, [rsi+40]                   ; symbol's own section
 
-cmp rsi, SEC_TEXT
-je rf_target_text
-mov rdi, rbx
-add rdi, DATA_FILE_START_OFF
-mov rdi, [rdi+0]
-add r11, rdi                        ; r11 = absolute target file offset
-rf_target_text:
+; Both ends are converted to virtual addresses (relative to LOAD_BASE)
+; rather than file offsets: the two coincide for .text and .data, but
+; .bss has no file offset at all, so vaddr is the only thing that works
+; for every section.
+push rax
+push rcx
+push rdx
+mov rdx, rsi
+call sec_vaddr_base
+add r11, rax                        ; r11 = target vaddr
+pop rdx
+pop rcx
+pop rax
 
-mov rsi, rax                        ; rsi = patch_off copy
-cmp rdx, SEC_TEXT
-je rf_patch_text
-mov rdi, rbx
-add rdi, DATA_FILE_START_OFF
-mov rdi, [rdi+0]
-add rsi, rdi                        ; rsi = absolute patch file offset
-rf_patch_text:
+push rax
+push rcx
+push rdx
+call sec_vaddr_base                 ; rdx already = the patch's section
+mov rsi, rax
+pop rdx
+pop rcx
+pop rax
+add rsi, rax                        ; rsi = patch vaddr
 
 cmp rcx, FIX_ABS64
 je rf_abs64
@@ -1597,6 +1671,56 @@ rf_next:
 add r9, 1
 jmp rf_loop
 rf_done:
+ret
+
+; ===========================================================================
+; compute_bss_vaddr -- .bss occupies memory but no file bytes, so it gets
+; a virtual address rather than a file offset: the next page after the
+; end of .data. Everything downstream (fixups, the program header) uses
+; this, which is also why fixup arithmetic is done in virtual addresses
+; -- for .text and .data the two happen to coincide, but for .bss there
+; is no file offset to work from at all.
+; ===========================================================================
+compute_bss_vaddr:
+mov rax, rbx
+add rax, DATA_FILE_START_OFF
+mov rax, [rax+0]
+mov rcx, rbx
+add rcx, SAVED_DATA_R15_OFF
+mov rcx, [rcx+0]
+mov rdx, rbx
+add rdx, DATABUF_OFF
+sub rcx, rdx                        ; data size
+add rax, rcx
+add rax, 4095
+mov rcx, PAGE_MASK
+and rax, rcx
+mov rcx, rbx
+add rcx, BSS_VADDR_OFF
+mov [rcx+0], rax
+ret
+
+; ===========================================================================
+; sec_vaddr_base -- in: rdx = section id; out: rax = that section's start
+; as an offset from LOAD_BASE. .text is 0, .data starts where the file
+; puts it, .bss starts on the page after .data.
+; ===========================================================================
+sec_vaddr_base:
+cmp rdx, SEC_TEXT
+je sec_vaddr_text
+cmp rdx, SEC_BSS
+je sec_vaddr_bss
+mov rax, rbx
+add rax, DATA_FILE_START_OFF
+mov rax, [rax+0]
+ret
+sec_vaddr_bss:
+mov rax, rbx
+add rax, BSS_VADDR_OFF
+mov rax, [rax+0]
+ret
+sec_vaddr_text:
+mov rax, 0
 ret
 
 ; ===========================================================================
@@ -1902,6 +2026,8 @@ cmp rax, PACK_TEXT
 je par_prescan_sec_text
 cmp rax, PACK_DATA
 je par_prescan_sec_data
+cmp rax, PACK_BSS
+je par_prescan_sec_bss
 jmp par_prescan_comment
 par_prescan_sec_text:
 mov rax, SEC_TEXT
@@ -1909,6 +2035,10 @@ mov [rsp+8], rax
 jmp par_prescan_comment
 par_prescan_sec_data:
 mov rax, SEC_DATA
+mov [rsp+8], rax
+jmp par_prescan_comment
+par_prescan_sec_bss:
+mov rax, SEC_BSS
 mov [rsp+8], rax
 jmp par_prescan_comment
 
@@ -2021,12 +2151,16 @@ mov rcx, rbx
 add rcx, DATABUF_OFF
 mov [rax+0], rcx
 mov rax, rbx
+add rax, SAVED_BSS_R15_OFF
+mov rcx, rbx
+add rcx, BSSBUF_OFF
+mov [rax+0], rcx
+; start the live cursor in whichever section this chunk begins in
+mov rax, rbx
 add rax, CUR_SECTION_OFF
-mov rax, [rax+0]
-cmp rax, SEC_DATA
-jne par_spawn_child_go
-mov r15, rbx
-add r15, DATABUF_OFF
+mov rdx, [rax+0]
+call sec_cursor_slot
+mov r15, [rax+0]
 par_spawn_child_go:
 mov rax, rbx
 add rax, DEFLIST_META_OFF
@@ -4234,6 +4368,8 @@ cmp rax, PACK_TEXT
 je do_section_text
 cmp rax, PACK_DATA
 je do_section_data
+cmp rax, PACK_BSS
+je do_section_bss
 jmp die_unknown_mnem
 
 parse_stmt_ident:
@@ -4404,10 +4540,12 @@ je parse_stmt_call_pop
 jmp die_unknown_mnem
 
 parse_stmt_bucket_r:
-cmp r9, 114                         ; 'r': ret
+cmp r9, 114                         ; 'r': ret, resb
 jne parse_stmt_bucket_s
 cmp r8, PACK_RET
 je parse_stmt_call_ret
+cmp r8, PACK_RESB
+je parse_stmt_call_resb
 jmp die_unknown_mnem
 
 parse_stmt_bucket_s:
@@ -4457,6 +4595,9 @@ call do_syscall
 ret
 parse_stmt_call_ret:
 call do_ret
+ret
+parse_stmt_call_resb:
+call do_resb
 ret
 parse_stmt_call_db:
 call do_db
@@ -4539,39 +4680,77 @@ ret
 ; section (e.g. two ".text" in a row).
 ; ===========================================================================
 do_section_text:
+mov rcx, SEC_TEXT
+jmp do_section_switch
+do_section_data:
+mov rcx, SEC_DATA
+jmp do_section_switch
+do_section_bss:
+mov rcx, SEC_BSS
+jmp do_section_switch
+
+; do_section_switch -- in: rcx = target section. Park the live cursor in
+; the section it belongs to, pick up the target's, and record the change.
+; Written generically rather than as a pair of text<->data special cases,
+; since there are three sections now.
+do_section_switch:
 mov rax, rbx
 add rax, CUR_SECTION_OFF
-mov rcx, [rax+0]
-cmp rcx, SEC_TEXT
-je do_section_text_done
-mov rdx, rbx
-add rdx, SAVED_DATA_R15_OFF
-mov [rdx+0], r15
-mov rdx, rbx
-add rdx, SAVED_TEXT_R15_OFF
-mov r15, [rdx+0]
-mov rcx, SEC_TEXT
+mov rdx, [rax+0]
+cmp rdx, rcx
+je do_section_switch_done
+push rcx
+call sec_cursor_slot               ; rdx = current section -> rax = slot
+mov [rax+0], r15
+pop rcx
+push rcx
+mov rdx, rcx
+call sec_cursor_slot               ; target's slot
+mov r15, [rax+0]
+pop rcx
+mov rax, rbx
+add rax, CUR_SECTION_OFF
 mov [rax+0], rcx
-do_section_text_done:
+do_section_switch_done:
 call skip_ws
 call skip_to_eol
 ret
 
-do_section_data:
+; sec_cursor_slot -- in: rdx = section id; out: rax = address of that
+; section's saved-cursor slot.
+sec_cursor_slot:
+cmp rdx, SEC_TEXT
+je sec_cursor_slot_text
+cmp rdx, SEC_BSS
+je sec_cursor_slot_bss
+mov rax, rbx
+add rax, SAVED_DATA_R15_OFF
+ret
+sec_cursor_slot_bss:
+mov rax, rbx
+add rax, SAVED_BSS_R15_OFF
+ret
+sec_cursor_slot_text:
+mov rax, rbx
+add rax, SAVED_TEXT_R15_OFF
+ret
+
+; ===========================================================================
+; resb N -- reserve N zero bytes. Only meaningful in .bss, where it just
+; advances the cursor: nothing is written, so the pages stay untouched
+; and the bytes never reach the file. Reserving space in .text or .data
+; would have to emit real zeros, which `db` already does, so it is an
+; error rather than a silently different meaning.
+; ===========================================================================
+do_resb:
 mov rax, rbx
 add rax, CUR_SECTION_OFF
-mov rcx, [rax+0]
-cmp rcx, SEC_DATA
-je do_section_data_done
-mov rdx, rbx
-add rdx, SAVED_TEXT_R15_OFF
-mov [rdx+0], r15
-mov rdx, rbx
-add rdx, SAVED_DATA_R15_OFF
-mov r15, [rdx+0]
-mov rcx, SEC_DATA
-mov [rax+0], rcx
-do_section_data_done:
+mov rax, [rax+0]
+cmp rax, SEC_BSS
+jne die_resb_section
+call skip_ws
+call resolve_imm_operand
+add r15, rax
 call skip_ws
 call skip_to_eol
 ret
@@ -4630,6 +4809,9 @@ mov rdi, msg_badscale
 jmp die_at_line
 die_bad_index:
 mov rdi, msg_badindex
+jmp die_at_line
+die_resb_section:
+mov rdi, msg_resbsection
 jmp die_at_line
 die_disp_range:
 mov rdi, msg_disprange
@@ -4801,6 +4983,9 @@ db "v1: index scale must be 1, 2, 4 or 8"
 db 0
 msg_badindex:
 db "v1: rsp cannot be used as an index register"
+db 0
+msg_resbsection:
+db "v1: resb is only valid in .bss"
 db 0
 msg_chunk_too_big:
 db "v1: parallel chunk exceeded its slot; retry with fewer jobs"
