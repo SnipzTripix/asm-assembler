@@ -1,0 +1,13 @@
+; regress_writable.v0 -- .data must be writable. Storing into an
+; initialized-data symbol used to fault, because .data was emitted R-only.
+.text
+mov rax, counter
+mov rbx, 5
+mov [rax+0], rbx
+mov rcx, [rax+0]
+mov rdi, rcx
+mov rax, 60
+syscall
+
+.data
+counter: dq 0

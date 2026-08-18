@@ -130,6 +130,8 @@ MAP_ANON        equ 0x22
 BUF_LEN         equ 0x4000000            ; 64 MiB input capacity
 TEXTBUF_OFF     equ 0x4000000            ; 64 MiB text capacity
 DATABUF_OFF     equ 0x8000000            ; 64 MiB data capacity
+TEXTBUF_CAP     equ 0x4000000
+DATABUF_CAP     equ 0x4000000
 SYMTAB_META_OFF equ 0xC000000
 SYMTAB_OFF      equ 0xC000008
 FIXUPS_META_OFF equ 0xD000000            ; + 16MB symtab region
@@ -140,7 +142,10 @@ SAVED_TEXT_R15_OFF equ 0xD800010         ; the OTHER section's cursor,
 SAVED_DATA_R15_OFF equ 0xD800018         ; while it isn't the active one
 DATA_FILE_START_OFF equ 0xD800020        ; set once by resolve_fixups
 INPUT_FD_OFF    equ 0xD800028            ; argv[1]-opened fd, else 0 (stdin)
-OUTPUT_FD_OFF   equ 0xD800030            ; argv[2]-opened fd, else 1 (stdout)
+OUTPUT_FD_OFF   equ 0xD800030            ; 1 (stdout) until the real file is
+                                          ; opened, which happens only once
+                                          ; there is output to write
+OUTPATH_OFF     equ 0xD8000A0            ; argv[2], or 1 when writing stdout
 
 ; --- parallel assembly state (see the "parallel" section further down) ---
 JOBS_OFF        equ 0xD800038            ; worker count; 1 = serial path
@@ -218,7 +223,7 @@ SLOT_TEXT_CAP   equ 0x600000             ; 6 MiB
 SLOT_DATA_OFF   equ 0x601000
 SLOT_DATA_CAP   equ 0x400000             ; 4 MiB
 SLOT_SYM_OFF    equ 0xA01000
-SLOT_SYM_CAP    equ 0x200000             ; 2 MiB / 32 B = 65536 labels
+SLOT_SYM_CAP    equ 0x200000             ; 2 MiB / 64 B = 32768 labels
 SLOT_FIX_OFF    equ 0xC01000
 SLOT_FIX_CAP    equ 0x300000             ; 3 MiB / 48 B = 65536 fixups
 SHARED_TOTAL    equ 0x10000000           ; MAX_JOBS * SLOT_SIZE = 256 MiB
@@ -237,11 +242,11 @@ SSYM_ENT        equ 64                   ; {name_ptr, name_len, value, section,
                                           ;  so the parent never re-runs FNV
 SFIX_ENT        equ 48                   ; {patch_off, patch_sec, kind,
                                           ;  name_ptr, name_len, target_hash}
-HDR_LEN         equ 232                  ; Ehdr(64) + 3 * Phdr(56): text,
-                                         ; data and bss. Constant even when
-                                         ; a section is unused -- text
+HDR_LEN         equ 288                  ; Ehdr(64) + 4 * Phdr(56): text, data,
+                                         ; bss and GNU_STACK. Constant even
+                                         ; when a section is unused: text
                                          ; offsets are fixed at parse time,
-                                         ; long before the sizes are known.
+                                         ; long before any size is known.
 PAGE_SIZE       equ 0x1000
 PAGE_MASK       equ 0xFFFFFFFFFFFFF000   ; low32 0xFFFFF000 sign-extends
                                          ; back to this exact 64-bit
@@ -389,18 +394,15 @@ cmp rax, 0
 jl die_open
 mov r13, rax
 start_check_output:
+; Only remember argv[2]; the file is not created until there is output to
+; put in it. Opening here left a 0-byte executable behind whenever
+; assembly failed later in the file -- a truncated artifact that looks
+; like a successful build.
 mov rax, [rsp+0]                    ; reload argc -- open's return value
                                     ; just clobbered rax
 cmp rax, 3
 jl start_argv_done
-mov rdi, [rsp+24]                   ; argv[2]
-mov rsi, O_WRONLY_CREAT_TRUNC
-mov rdx, MODE_755
-mov rax, SYS_open
-syscall
-cmp rax, 0
-jl die_open
-mov r14, rax
+mov r14, [rsp+24]                   ; argv[2] path, opened at write time
 start_argv_done:
 ; argv[3] = worker count (default 1 = the original serial path). Parsed
 ; here, before mmap, and stashed in r11 -- the private region it will
@@ -456,8 +458,12 @@ mov rax, rbx
 add rax, INPUT_FD_OFF
 mov [rax+0], r13
 mov rax, rbx
-add rax, OUTPUT_FD_OFF
+add rax, OUTPATH_OFF
 mov [rax+0], r14
+mov rax, rbx
+add rax, OUTPUT_FD_OFF
+mov rcx, 1                          ; stdout until argv[2] is opened
+mov [rax+0], rcx
 mov rax, rbx
 add rax, JOBS_OFF
 mov [rax+0], r11
@@ -538,6 +544,13 @@ jne die_input_too_large        ; not negative and not zero -> read a real
                                ; byte -- input didn't fit in BUF_LEN
 read_done:
 add r12, rbx
+mov rax, rbx
+add rax, LINE_START_OFF
+mov [rax+0], rbx           ; valid before expand_includes can fail
+mov rax, rbx
+add rax, LINE_OFF
+mov rcx, 1
+mov [rax+0], rcx
 call expand_includes               ; splice included files in before any
                                     ; parsing, chunking or line counting
 mov r13, rbx
@@ -605,6 +618,7 @@ je blank_line
 cmp rax, CH_SEMI
 je comment_line
 call parse_stmt
+call check_out_bounds
 jmp stmt_loop
 blank_line:
 add r13, 1
@@ -656,15 +670,25 @@ mov rax, [rax+0]                    ; rax = DATA_FILE_START (page-aligned)
 ; Elf64_Ehdr byte offsets: 0 ident[16] 16 type 18 machine 20 version
 ;   24 entry 32 phoff 40 shoff 48 flags 52 ehsize 54 phentsize 56 phnum
 ;   58 shentsize 60 shnum 62 shstrndx                    (total 64)
-; Elf64_Phdr (56B each, two of them now: text R+X at 64, data R at 120).
-; byte offsets within a Phdr: 0 type 4 flags 8 offset 16 vaddr 24 paddr
-; 32 filesz 40 memsz 48 align
-; v0.2's mov is always a full 8-byte store, so every field narrower than a
-; qword goes through movb one byte at a time here -- packing several
-; fields into one qword write (as seed.asm's nasm-level `mov word`/`mov
-; dword` do) would silently overwrite whatever comes right after it.
-; rax/rsi/rdi (DATA_FILE_START/text_size/data_size) survive throughout:
-; nothing below touches them except where a fresh `mov rax,` is shown.
+;
+; Program headers are appended one after another from offset 64, and only
+; for segments that actually exist. They used to live in three fixed
+; slots with a chained phnum count, which got .bss wrong whenever .data
+; was empty: the chain returned 1 at the first test and never looked at
+; bss, so a program with .bss and no .data emitted no bss segment at all
+; and segfaulted on its first access. Counting and placement are now
+; driven by the same has_* tests, so the two cannot disagree.
+;
+; rsi = text_size, rdi = data_size, rax = DATA_FILE_START on entry; r8
+; picks up bss_size, and r12 becomes the phdr write cursor (the input is
+; long since consumed by this point).
+mov r8, rbx
+add r8, SAVED_BSS_R15_OFF
+mov r8, [r8+0]
+mov rcx, rbx
+add rcx, BSSBUF_OFF
+sub r8, rcx                         ; r8 = bss_size
+
 mov rcx, 127
 movb [r14+0], rcx
 mov rcx, 69
@@ -673,24 +697,24 @@ mov rcx, 76
 movb [r14+2], rcx
 mov rcx, 70
 movb [r14+3], rcx
-mov rcx, 2
+mov rcx, 2                          ; ELFCLASS64
 movb [r14+4], rcx
-mov rcx, 1
+mov rcx, 1                          ; ELFDATA2LSB
 movb [r14+5], rcx
-movb [r14+6], rcx
+movb [r14+6], rcx                   ; EV_CURRENT
 mov rcx, 0
 movb [r14+7], rcx
-mov [r14+8], rcx
+mov [r14+8], rcx                    ; ABI version + padding
 
-mov rcx, 2
+mov rcx, 2                          ; e_type = ET_EXEC
 movb [r14+16], rcx
 mov rcx, 0
 movb [r14+17], rcx
-mov rcx, 62
+mov rcx, 62                         ; e_machine = EM_X86_64
 movb [r14+18], rcx
 mov rcx, 0
 movb [r14+19], rcx
-mov rcx, 1
+mov rcx, 1                          ; e_version
 movb [r14+20], rcx
 mov rcx, 0
 movb [r14+21], rcx
@@ -699,41 +723,123 @@ movb [r14+23], rcx
 
 mov rcx, LOAD_BASE
 add rcx, HDR_LEN
-mov [r14+24], rcx
+mov [r14+24], rcx                   ; e_entry
 mov rcx, 64
-mov [r14+32], rcx
+mov [r14+32], rcx                   ; e_phoff
 mov rcx, 0
-mov [r14+40], rcx
+mov [r14+40], rcx                   ; e_shoff: no section headers
 
-movb [r14+48], rcx
+movb [r14+48], rcx                  ; e_flags
 movb [r14+49], rcx
 movb [r14+50], rcx
 movb [r14+51], rcx
 mov rcx, 64
-movb [r14+52], rcx
+movb [r14+52], rcx                  ; e_ehsize
 mov rcx, 0
 movb [r14+53], rcx
 mov rcx, 56
-movb [r14+54], rcx
-; e_phnum: only describe segments that exist. An empty .data would
-; otherwise be a zero-length mapping and would pad the file out to a page
-; boundary for nothing (a one-line program used to emit 4096 bytes), and
-; an empty .bss likewise.
-mov r8, rbx
-add r8, SAVED_BSS_R15_OFF
-mov r8, [r8+0]
-mov r9, rbx
-add r9, BSSBUF_OFF
-sub r8, r9                          ; r8 = bss size, kept for the phdr below
-mov rcx, 1
+movb [r14+54], rcx                  ; e_phentsize
+mov rcx, 0
+movb [r14+55], rcx
+
+; --- program headers, packed in order, counting as we go ---
+mov r12, r14
+add r12, 64                         ; phdr write cursor
+mov r11, 0                          ; phdr count
+
+; text: always present, R+X, and it carries the ELF header itself
+push rax
+push rdi
+push rsi
+push r8                             ; r8 is bss_size and must survive
+mov rdi, r12
+mov r10, 1                          ; PT_LOAD
+mov rcx, 5                          ; PF_R|PF_X
+mov rdx, 0                          ; vaddr offset
+mov r8, rsi                         ; filesz = text_size
+mov r9, rsi                         ; memsz  = text_size
+mov rsi, 0                          ; p_offset
+call write_phdr
+pop r8
+pop rsi
+pop rdi
+pop rax
+add r12, 56
+add r11, 1
+
+; data: only when non-empty. R+W, not R -- initialized data that cannot
+; be written to is a .rodata wearing the wrong name, and storing to it
+; faulted with no diagnostic.
 cmp rdi, 0
-je phnum_have
-mov rcx, 2
+je phdr_no_data
+push rax
+push rdi
+push rsi
+mov rsi, rax                        ; p_offset = DATA_FILE_START
+mov rdx, rax                        ; same vaddr offset
+mov r9, rdi                         ; memsz = filesz = data_size
+mov rdi, r12
+mov r10, 1
+mov rcx, 6                          ; PF_R|PF_W
+push r8
+mov r8, r9                          ; filesz
+call write_phdr
+pop r8
+pop rsi
+pop rdi
+pop rax
+add r12, 56
+add r11, 1
+phdr_no_data:
+
+; bss: only when non-empty. No file content at all -- filesz 0, memsz the
+; reserved size, which is what makes the kernel zero-fill it.
 cmp r8, 0
-je phnum_have
-mov rcx, 3
-phnum_have:
-movb [r14+56], rcx
+je phdr_no_bss
+push rax
+push rdi
+push rsi
+push r8
+mov rdx, rbx
+add rdx, BSS_VADDR_OFF
+mov rdx, [rdx+0]                    ; vaddr offset
+mov rsi, rax
+add rsi, rdi                        ; p_offset: just past .data in the file
+mov r9, r8                          ; memsz = reserved size
+mov r8, 0                           ; filesz = 0
+mov rdi, r12
+mov r10, 1
+mov rcx, 6                          ; PF_R|PF_W
+call write_phdr
+pop r8
+pop rsi
+pop rdi
+pop rax
+add r12, 56
+add r11, 1
+phdr_no_bss:
+
+; PT_GNU_STACK: without it the kernel gives the process an executable
+; stack. All-zero addresses and sizes; only the flags matter.
+push rax
+push rdi
+push rsi
+push r8
+mov rdi, r12
+mov r10, 0x6474E551
+mov rcx, 6                          ; RW, deliberately not X
+mov rsi, 0
+mov rdx, 0
+mov r8, 0
+mov r9, 0
+call write_phdr_raw                 ; no LOAD_BASE bias on a null vaddr
+pop r8
+pop rsi
+pop rdi
+pop rax
+add r11, 1
+
+movb [r14+56], r11                  ; e_phnum
 mov rcx, 0
 movb [r14+57], rcx
 movb [r14+58], rcx
@@ -742,86 +848,6 @@ movb [r14+60], rcx
 movb [r14+61], rcx
 movb [r14+62], rcx
 movb [r14+63], rcx
-
-; Phdr #1: text, R+X, at file offset 0
-mov rcx, 1
-movb [r14+64], rcx
-mov rcx, 0
-movb [r14+65], rcx
-movb [r14+66], rcx
-movb [r14+67], rcx
-mov rcx, 5
-movb [r14+68], rcx
-mov rcx, 0
-movb [r14+69], rcx
-movb [r14+70], rcx
-movb [r14+71], rcx
-
-mov rcx, 0
-mov [r14+72], rcx                   ; p_offset
-mov rcx, LOAD_BASE
-mov [r14+80], rcx                   ; p_vaddr
-mov [r14+88], rcx                   ; p_paddr
-mov [r14+96], rsi                   ; p_filesz = text_size
-mov [r14+104], rsi                  ; p_memsz
-mov rcx, 4096
-mov [r14+112], rcx                  ; p_align
-
-; Phdr #2: data, R only, at the page-aligned DATA_FILE_START
-mov rcx, 1
-movb [r14+120], rcx
-mov rcx, 0
-movb [r14+121], rcx
-movb [r14+122], rcx
-movb [r14+123], rcx
-mov rcx, 4                          ; PF_R only -- no X, no W
-movb [r14+124], rcx
-mov rcx, 0
-movb [r14+125], rcx
-movb [r14+126], rcx
-movb [r14+127], rcx
-
-mov [r14+128], rax                  ; p_offset = DATA_FILE_START
-mov rcx, LOAD_BASE
-add rcx, rax
-mov [r14+136], rcx                  ; p_vaddr
-mov [r14+144], rcx                  ; p_paddr
-mov [r14+152], rdi                  ; p_filesz = data_size
-mov [r14+160], rdi                  ; p_memsz
-mov rcx, 4096
-mov [r14+168], rcx                  ; p_align
-
-; Phdr #3: bss, R+W, no file content at all -- p_filesz 0 and p_memsz the
-; reserved size, which is the whole point: the kernel zero-fills it.
-mov rcx, 1
-movb [r14+176], rcx
-mov rcx, 0
-movb [r14+177], rcx
-movb [r14+178], rcx
-movb [r14+179], rcx
-mov rcx, 6                          ; PF_R|PF_W -- reserved space is writable
-movb [r14+180], rcx
-mov rcx, 0
-movb [r14+181], rcx
-movb [r14+182], rcx
-movb [r14+183], rcx
-
-mov rcx, rax
-add rcx, rdi                        ; sits just past .data in the file, but
-mov [r14+184], rcx                  ; contributes no bytes to it
-mov r9, rbx
-add r9, BSS_VADDR_OFF
-mov r9, [r9+0]
-mov rcx, LOAD_BASE
-add rcx, r9
-mov [r14+192], rcx                  ; p_vaddr
-mov [r14+200], rcx                  ; p_paddr
-mov rcx, 0
-mov [r14+208], rcx                  ; p_filesz = 0: nothing on disk
-mov [r14+216], r8                   ; p_memsz  = reserved size
-mov rcx, 4096
-mov [r14+224], rcx                  ; p_align
-
 ; --- write the output image: header+text, then zero padding up to the
 ; page boundary (sourced from r14 past text_size, which is guaranteed
 ; zero -- fresh mmap, never written past there), then data. A syscall
@@ -831,6 +857,30 @@ mov [r14+224], rcx                  ; p_align
 mov r8, rax                         ; r8 = DATA_FILE_START
 mov r9, rsi                         ; r9 = text_size
 mov r10, rdi                        ; r10 = data_size
+
+; Create the output file now, at the first moment there is something
+; valid to put in it -- see start_check_output.
+mov rax, rbx
+add rax, OUTPATH_OFF
+mov rdi, [rax+0]
+cmp rdi, 1
+je out_is_stdout
+push r8
+push r9
+push r10
+mov rsi, O_WRONLY_CREAT_TRUNC
+mov rdx, MODE_755
+mov rax, SYS_open
+syscall
+pop r10
+pop r9
+pop r8
+cmp rax, 0
+jl die_open
+mov rcx, rbx
+add rcx, OUTPUT_FD_OFF
+mov [rcx+0], rax
+out_is_stdout:
 
 mov rdx, r9
 mov rsi, r14
@@ -1918,6 +1968,81 @@ mem_move_up_done:
 ret
 
 ; ===========================================================================
+; check_out_bounds -- has the output cursor run past the end of the
+; buffer it is writing into?
+;
+; Every input field is range-checked, but the output buffer never was:
+; emitters advance r15 with no ceiling, so a large enough source walked
+; text into the data buffer and then into the symbol table, corrupting
+; both with no error. Checking once per statement rather than per emitted
+; byte costs nothing measurable (one compare against a bound per line)
+; and still catches the overrun before anything downstream reads the
+; damage -- no single statement can emit more than a handful of bytes,
+; and the one that can (resb) checks itself.
+;   clob: nothing (all scratch is restored)
+; ===========================================================================
+check_out_bounds:
+push rax
+push rcx
+push rdx
+mov rax, rbx
+add rax, CUR_SECTION_OFF
+mov rdx, [rax+0]
+cmp rdx, SEC_TEXT
+je cob_text
+cmp rdx, SEC_BSS
+je cob_bss
+mov rcx, rbx
+add rcx, DATABUF_OFF
+add rcx, DATABUF_CAP
+jmp cob_check
+cob_bss:
+mov rcx, rbx
+add rcx, BSSBUF_OFF
+add rcx, BSSBUF_CAP
+jmp cob_check
+cob_text:
+mov rcx, r14
+add rcx, TEXTBUF_CAP
+cob_check:
+cmp r15, rcx
+jae die_section_overflow
+pop rdx
+pop rcx
+pop rax
+ret
+
+; ===========================================================================
+; write_phdr / write_phdr_raw -- fill one Elf64_Phdr.
+;   rdi = destination, r10 = p_type, rcx = p_flags, rsi = p_offset,
+;   rdx = p_vaddr (relative to LOAD_BASE for write_phdr, absolute for
+;   write_phdr_raw), r8 = p_filesz, r9 = p_memsz
+;
+; p_type and p_flags are adjacent 4-byte fields, so they go out as one
+; qword with the flags shifted into the high half -- this dialect's mov
+; always writes 8 bytes, and writing them separately would have each
+; store clobber the other.
+;   Phdr layout: 0 type 4 flags 8 offset 16 vaddr 24 paddr 32 filesz
+;                40 memsz 48 align
+; ===========================================================================
+write_phdr:
+mov rax, LOAD_BASE
+add rdx, rax
+write_phdr_raw:
+mov rax, rcx
+shl rax, 32
+add rax, r10
+mov [rdi+0], rax                   ; p_type | p_flags << 32
+mov [rdi+8], rsi                   ; p_offset
+mov [rdi+16], rdx                  ; p_vaddr
+mov [rdi+24], rdx                  ; p_paddr
+mov [rdi+32], r8                   ; p_filesz
+mov [rdi+40], r9                   ; p_memsz
+mov rax, PAGE_SIZE
+mov [rdi+48], rax                  ; p_align
+ret
+
+; ===========================================================================
 ; compute_bss_vaddr -- .bss occupies memory but no file bytes, so it gets
 ; a virtual address rather than a file offset: the next page after the
 ; end of .data. Everything downstream (fixups, the program header) uses
@@ -2128,12 +2253,20 @@ add rax, JOBS_OFF
 mov r8, [rax+0]                     ; r8 = jobs
 mov r9, 0                           ; r9 = chunk index
 mov r10, rbx                        ; r10 = current chunk start
-mov r11, SEC_TEXT                   ; r11 = section at chunk start
-push r11                            ; [rsp] = running section
+; A chunk must record the line and section it BEGINS at. Recording the
+; running values at the moment the chunk is closed stores the state at
+; its END instead, which is the next chunk's start -- every chunk then
+; got the following chunk's line base (worker line numbers came out a
+; whole chunk too high) and, worse, the following chunk's section, so a
+; chunk that began in .data could be assembled into .text.
+; stack: [rsp]=line, [rsp+8]=this chunk's first line,
+;        [rsp+16]=running section, [rsp+24]=this chunk's opening section
+mov rax, SEC_TEXT
+push rax                            ; [rsp+24] chunk opening section
+push rax                            ; [rsp+16] running section
 mov rax, 1
-push rax                            ; [rsp+8] would be line... see below
-; stack: [rsp]=line number, [rsp+8]=running section
-; (pushed in that order so the two are addressable as [rsp+0]/[rsp+8])
+push rax                            ; [rsp+8] chunk first line
+push rax                            ; [rsp]   running line
 
 par_prescan_line:
 cmp r13, r12
@@ -2162,10 +2295,15 @@ add rdi, CHUNKTAB_OFF
 add rax, rdi
 mov [rax+0], r10
 mov [rax+8], r13
+mov rcx, [rsp+24]
+mov [rax+16], rcx                  ; section this chunk BEGAN in
 mov rcx, [rsp+8]
-mov [rax+16], rcx                  ; section this chunk began in
+mov [rax+24], rcx                  ; line this chunk BEGAN on
+; the state right here is where the next chunk starts
+mov rcx, [rsp+16]
+mov [rsp+24], rcx
 mov rcx, [rsp+0]
-mov [rax+24], rcx                  ; line number this chunk begins on
+mov [rsp+8], rcx
 mov r10, r13
 add r9, 1
 par_prescan_noboundary:
@@ -2275,15 +2413,15 @@ je par_prescan_sec_bss
 jmp par_prescan_comment
 par_prescan_sec_text:
 mov rax, SEC_TEXT
-mov [rsp+8], rax
+mov [rsp+16], rax
 jmp par_prescan_comment
 par_prescan_sec_data:
 mov rax, SEC_DATA
-mov [rsp+8], rax
+mov [rsp+16], rax
 jmp par_prescan_comment
 par_prescan_sec_bss:
 mov rax, SEC_BSS
-mov [rsp+8], rax
+mov [rsp+16], rax
 jmp par_prescan_comment
 
 par_prescan_blank:
@@ -2310,10 +2448,10 @@ add rdi, CHUNKTAB_OFF
 add rax, rdi
 mov [rax+0], r10
 mov [rax+8], r12
+mov rcx, [rsp+24]
+mov [rax+16], rcx                  ; section this chunk BEGAN in
 mov rcx, [rsp+8]
-mov [rax+16], rcx
-mov rcx, [rsp+0]
-mov [rax+24], rcx
+mov [rax+24], rcx                  ; line this chunk BEGAN on
 add r9, 1
 par_prescan_pad:
 cmp r9, r8
@@ -2332,6 +2470,8 @@ mov [rax+24], rcx
 add r9, 1
 jmp par_prescan_pad
 par_prescan_fin:
+pop rax
+pop rax
 pop rax
 pop rax
 ret
@@ -2687,6 +2827,13 @@ call mem_copy
 mov rax, rbx
 add rax, DEFLIST_META_OFF
 mov r8, [rax+0]                    ; count
+; A chunk with more labels than its slot holds would overrun into the
+; next worker's shared slot -- MAP_SHARED memory another process is
+; reading. The declared capacity is enforced here, not merely declared.
+mov rax, r8
+shl rax, 6                         ; * SSYM_ENT
+cmp rax, SLOT_SYM_CAP
+jae par_we_toobig
 mov rax, [rsp+0]
 mov rcx, rax
 add rcx, SM_NSYM
@@ -2726,6 +2873,13 @@ par_we_sym_done:
 mov rax, rbx
 add rax, FIXUPS_META_OFF
 mov r8, [rax+0]
+mov rax, r8
+shl rax, 5
+mov rcx, r8
+shl rcx, 4
+add rax, rcx                       ; * SFIX_ENT (48)
+cmp rax, SLOT_FIX_CAP
+jae par_we_toobig
 mov rax, [rsp+0]
 mov rcx, rax
 add rcx, SM_NFIX
@@ -4581,7 +4735,7 @@ do_db_string:
 add r13, 1
 do_db_copy:
 cmp r13, r12
-jae die_bad_operand
+jae die_unterminated
 movb rax, [r13+0]
 cmp rax, CH_QUOTE
 je do_db_close
@@ -4595,7 +4749,7 @@ jmp do_db_copy
 do_db_escape:
 add r13, 1
 cmp r13, r12
-jae die_bad_operand
+jae die_unterminated
 movb rax, [r13+0]
 cmp rax, CH_n
 je do_db_esc_nl
@@ -4763,7 +4917,22 @@ mov rsi, r10
 mov rcx, r11
 call find_or_create_symbol
 call define_label
+; A label may be followed on the same line by the statement it labels --
+; `buf: resb 64`, `loop: mov rax, rbx`. Skipping to end-of-line here, as
+; this used to, silently threw that statement away: the label was
+; defined, the instruction never emitted, and nothing was reported. Any
+; remainder is re-entered as a statement in its own right (a tail call,
+; so the original caller's return address still applies).
 call skip_ws
+cmp r13, r12
+jae parse_stmt_label_eol
+movb rax, [r13+0]
+cmp rax, CH_NL
+je parse_stmt_label_eol
+cmp rax, CH_SEMI
+je parse_stmt_label_eol
+jmp parse_stmt
+parse_stmt_label_eol:
 call skip_to_eol
 ret
 
@@ -5123,6 +5292,16 @@ cmp rax, SEC_BSS
 jne die_resb_section
 call skip_ws
 call resolve_imm_operand
+; The reservation is the one place a single statement can move the
+; output cursor arbitrarily far, so it is checked here rather than
+; relying on the per-statement bound below. (resolve_imm_operand parses
+; unsigned, so a negative count is already rejected as a bad operand.)
+mov rcx, rbx
+add rcx, BSSBUF_OFF
+add rcx, BSSBUF_CAP
+sub rcx, r15                       ; bytes still available in .bss
+cmp rcx, rax
+jl die_section_overflow
 add r15, rax
 call skip_ws
 call skip_to_eol
@@ -5198,6 +5377,9 @@ jmp die_at_line
 die_bad_escape:
 mov rdi, msg_badescape
 jmp die_at_line
+die_unterminated:
+mov rdi, msg_unterminated
+jmp die_at_line
 die_bad_scale:
 mov rdi, msg_badscale
 jmp die_at_line
@@ -5207,12 +5389,15 @@ jmp die_at_line
 die_resb_section:
 mov rdi, msg_resbsection
 jmp die_at_line
+die_section_overflow:
+mov rdi, msg_sectionoverflow
+jmp die_at_line
 die_bad_include:
 mov rdi, msg_badinclude
-jmp die_at_line
+jmp die
 die_include_loop:
 mov rdi, msg_includeloop
-jmp die_at_line
+jmp die
 die_disp_range:
 mov rdi, msg_disprange
 jmp die_at_line
@@ -5390,6 +5575,9 @@ db 0
 msg_badescape:
 db "v1: unknown escape sequence in string"
 db 0
+msg_unterminated:
+db "v1: unterminated string literal"
+db 0
 msg_badscale:
 db "v1: index scale must be 1, 2, 4 or 8"
 db 0
@@ -5399,11 +5587,16 @@ db 0
 msg_resbsection:
 db "v1: resb is only valid in .bss"
 db 0
+msg_sectionoverflow:
+db "v1: section too large for its output buffer"
+db 0
 msg_badinclude:
 db "v1: malformed %include (expected: %include \"file\")"
+db 10
 db 0
 msg_includeloop:
 db "v1: too many %include expansions (a file including itself?)"
+db 10
 db 0
 msg_chunk_too_big:
 db "v1: parallel chunk exceeded its slot; retry with fewer jobs"

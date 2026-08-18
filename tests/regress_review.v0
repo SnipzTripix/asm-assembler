@@ -1,0 +1,13 @@
+; regress_review.v0 -- .bss with no .data at all, and a label sharing a
+; line with the statement it labels. Both silently produced a broken or
+; incomplete binary before. Exits 42.
+.text
+start: mov rax, buf
+mov rbx, 42
+mov [rax+0], rbx
+mov rdi, [rax+0]
+mov rax, 60
+syscall
+
+.bss
+buf: resb 64

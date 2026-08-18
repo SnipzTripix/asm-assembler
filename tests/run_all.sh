@@ -53,6 +53,9 @@ echo "=== .bss / resb ==="
 echo "=== %include ==="
 ./tests/check_include.sh "$V" || fail=1
 
+echo "=== review regressions ==="
+./tests/check_review.sh "$V" || fail=1
+
 echo "=== range / overflow regressions ==="
 ./tests/regress_range.sh "$V"
 
