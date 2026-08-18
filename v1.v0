@@ -3856,14 +3856,82 @@ cmp rax, CH_COMMA
 jne die_bad_operand
 add r13, 1
 call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_MINUS
+je do_imul_imm
+cmp rax, CH_0
+jl do_imul_reg
+cmp rax, CH_9PLUS1
+jae do_imul_reg
+
+do_imul_imm:
+; 69 /r id -- the three-operand form with source and destination the
+; same register, which is how `imul reg, imm` is actually encoded
+call parse_signed_imm
+mov r9, rax
+pop rax
+call emit_imul_imm
+jmp do_imul_tail
+
+do_imul_reg:
 call parse_reg
 cmp rax, NEG_ONE
+jne do_imul_have_src
+call scan_ident                    ; not a register: try an equ constant
+cmp rcx, 0
 je die_bad_operand
+call try_resolve_const
+cmp rdx, 0
+je die_bad_operand
+mov r9, rax
+pop rax
+call emit_imul_imm
+jmp do_imul_tail
+do_imul_have_src:
 mov rdx, rax
 pop rax
 call emit_imul
+do_imul_tail:
 call skip_ws
 call skip_to_eol
+ret
+
+; ===========================================================================
+; emit_imul_imm -- REX.W + 69 /r + imm32 (IMUL r64, r/m64, imm32), with
+; ModRM naming the destination as both reg and rm so it reads as the
+; two-operand `imul dst, imm`.
+;   in: rax = dst reg, r9 = imm32 -> r15 += 7
+; ===========================================================================
+emit_imul_imm:
+push rax
+mov rax, r9
+call check_imm32                   ; only imm32 fits; wider must not truncate
+pop rax
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+shl rsi, 2                         ; REX.R (dst is also the reg field)
+add rcx, rsi
+mov rsi, rax
+shr rsi, 3                         ; REX.B (and the rm field)
+add rcx, rsi
+movb [r15+0], rcx
+mov rcx, 0x69
+movb [r15+1], rcx
+mov rsi, rax
+and rsi, 7
+mov rdi, rsi
+shl rsi, 3
+add rsi, rdi
+add rsi, 0xC0                      ; mod=11, reg=dst, rm=dst
+movb [r15+2], rsi
+mov rdi, r15
+add rdi, 3
+mov rax, r9
+call store_dword
+add r15, 7
 ret
 
 ; ===========================================================================
@@ -3885,15 +3953,80 @@ cmp rax, CH_COMMA
 jne die_bad_operand
 add r13, 1
 call skip_ws
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_MINUS
+je do_test_imm
+cmp rax, CH_0
+jl do_test_reg
+cmp rax, CH_9PLUS1
+jae do_test_reg
+
+do_test_imm:
+; F7 /0 id -- test has its own immediate form rather than sharing the
+; 81 /digit group the arithmetic ops use
+call parse_signed_imm
+mov r9, rax
+pop rax
+mov r10, 0
+call emit_grp3_imm
+jmp do_test_tail
+
+do_test_reg:
 call parse_reg
 cmp rax, NEG_ONE
+jne do_test_have_src
+call scan_ident
+cmp rcx, 0
 je die_bad_operand
+call try_resolve_const
+cmp rdx, 0
+je die_bad_operand
+mov r9, rax
+pop rax
+mov r10, 0
+call emit_grp3_imm
+jmp do_test_tail
+do_test_have_src:
 mov rdx, rax
 pop rax
 mov r10, 0x85
 call emit_rr
+do_test_tail:
 call skip_ws
 call skip_to_eol
+ret
+
+; ===========================================================================
+; emit_grp3_imm -- REX.W + F7 /digit + ModRM + imm32 (group 3: /0 is
+; TEST r/m64, imm32). Same shape as emit_grp1_imm, different opcode.
+;   in: r10 = /digit, rax = dst reg, r9 = imm32 -> r15 += 7
+; ===========================================================================
+emit_grp3_imm:
+push rax
+mov rax, r9
+call check_imm32
+pop rax
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3                         ; REX.B: /digit is an opcode extension,
+add rcx, rsi                       ; so REX.R is never set here
+movb [r15+0], rcx
+mov rsi, 0xF7
+movb [r15+1], rsi
+mov rsi, rax
+and rsi, 7
+mov rdi, r10
+shl rdi, 3
+add rsi, rdi
+add rsi, 0xC0                      ; mod = 11
+movb [r15+2], rsi
+mov rdi, r15
+add rdi, 3
+mov rax, r9
+call store_dword
+add r15, 7
 ret
 
 ; ===========================================================================

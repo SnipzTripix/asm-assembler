@@ -36,6 +36,10 @@ lea rbx, [rax+rax*4+16000]
 lea r12, [r13+9000]
 imul rax, rcx
 imul r8, r9
+imul rcx, 100000
+imul r11, 250000
+test rcx, 123456
+test r11, 654321
 test rax, rbx
 test r8, r9
 neg rax
