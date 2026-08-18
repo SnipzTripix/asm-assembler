@@ -145,7 +145,13 @@ INPUT_FD_OFF    equ 0xD800028            ; argv[1]-opened fd, else 0 (stdin)
 OUTPUT_FD_OFF   equ 0xD800030            ; 1 (stdout) until the real file is
                                           ; opened, which happens only once
                                           ; there is output to write
-OUTPATH_OFF     equ 0xD8000A0            ; argv[2], or 1 when writing stdout
+OUTPATH_OFF     equ 0xD800500            ; argv[2], or 1 when writing stdout.
+                                          ; Must stay clear of CHUNKTAB, which
+                                          ; spans MAX_JOBS * CHUNK_ENT bytes
+                                          ; from CHUNKTAB_OFF -- this sat at
+                                          ; 0xD8000A0, exactly chunk 1, so every
+                                          ; parallel run had worker 1 overwrite
+                                          ; the output path.
 
 ; --- parallel assembly state (see the "parallel" section further down) ---
 JOBS_OFF        equ 0xD800038            ; worker count; 1 = serial path
@@ -210,7 +216,13 @@ MAX_JOBS        equ 16
 PAR_MIN_BYTES   equ 262144               ; below ~256 KiB the fork+merge
                                           ; overhead exceeds what parallel
                                           ; assembly saves, so -j is ignored
-CHUNK_ENT       equ 32                   ; {start:8, end:8, section:8, pad:8}
+CHUNK_ENT       equ 64                   ; {start, end, section, first_line,
+                                          ;  text_base, data_base, 2 spare}
+CHUNK_SHIFT     equ 6                    ; log2(CHUNK_ENT) -- indexing uses this
+                                          ; rather than a bare 6, so the stride
+                                          ; and the layout cannot drift apart
+                                          ; again (they had: CHUNK_ENT said 32
+                                          ; while every index site shifted by 6)
 
 ; --- one MAP_SHARED slot per worker: the only memory a worker and the
 ; parent both see. Everything else a worker touches is copy-on-write
@@ -233,8 +245,12 @@ SM_TEXTSZ       equ 0
 SM_DATASZ       equ 8
 SM_NSYM         equ 16
 SM_NFIX         equ 24
-SM_ERR          equ 32                   ; 0 = ok, else a msg id (see wk_die)
-SM_ERRLINE      equ 40
+; A worker that dies writes its own diagnostic to fd 2, which it shares
+; with the parent, so the message reaches the user with a correct line
+; number and no marshalling is needed. Slots therefore carry no error
+; fields; two used to be declared here, pointing at a reporter that was
+; never written.
+
 
 SSYM_ENT        equ 64                   ; {name_ptr, name_len, value, section,
                                           ;  hash} -- power of 2 so indexing
@@ -2289,7 +2305,7 @@ cmp rcx, rdx
 jl par_prescan_noboundary
 ; close chunk r9: [start, r13)
 mov rax, r9
-shl rax, 6
+shl rax, CHUNK_SHIFT
 mov rdi, rbx
 add rdi, CHUNKTAB_OFF
 add rax, rdi
@@ -2442,7 +2458,7 @@ par_prescan_eof:
 ; close the final chunk, and give any chunks we never reached an empty
 ; range so the spawn/merge loops can treat all JOBS uniformly
 mov rax, r9
-shl rax, 6
+shl rax, CHUNK_SHIFT
 mov rdi, rbx
 add rdi, CHUNKTAB_OFF
 add rax, rdi
@@ -2457,7 +2473,7 @@ par_prescan_pad:
 cmp r9, r8
 jae par_prescan_fin
 mov rax, r9
-shl rax, 6
+shl rax, CHUNK_SHIFT
 mov rdi, rbx
 add rdi, CHUNKTAB_OFF
 add rax, rdi
@@ -2507,7 +2523,7 @@ mov rax, rbx
 add rax, MYJOB_OFF
 mov [rax+0], r9
 mov rax, r9
-shl rax, 6
+shl rax, CHUNK_SHIFT
 mov rdi, rbx
 add rdi, CHUNKTAB_OFF
 add rax, rdi
@@ -3040,7 +3056,7 @@ push rax                           ; [rsp] = slot
 
 ; record this chunk's bases, then copy its bytes into place
 mov rax, r9
-shl rax, 6
+shl rax, CHUNK_SHIFT
 mov rcx, rbx
 add rcx, CHUNKTAB_OFF
 add rax, rcx
@@ -3139,7 +3155,7 @@ cmp rcx, 0
 jne par_merge_dup
 ; final value = local + this chunk's base for its section
 mov rcx, r9
-shl rcx, 6
+shl rcx, CHUNK_SHIFT
 mov rsi, rbx
 add rsi, CHUNKTAB_OFF
 add rcx, rsi
@@ -3263,7 +3279,7 @@ push rsi
 push rdx
 push r8
 mov rax, r9
-shl rax, 6
+shl rax, CHUNK_SHIFT
 mov rsi, rbx
 add rsi, CHUNKTAB_OFF
 add rax, rsi
