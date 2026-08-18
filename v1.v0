@@ -170,7 +170,7 @@ MEM_SCALE_OFF   equ 0xE220008            ; SIB scale field (0..3 = 1,2,4,8)
 SAVED_BSS_R15_OFF equ 0xE220010          ; .bss cursor while inactive
 BSS_VADDR_OFF   equ 0xE220018            ; where .bss lands in memory,
                                           ; relative to LOAD_BASE
-MMAP_TOTAL      equ 0x12230000           ; through the end of BSSBUF
+MMAP_TOTAL      equ 0x13230000           ; through the end of INCBUF
 
 ; .bss gets a real buffer like the other sections, so r15 and every label
 ; and emitter work there unchanged -- it simply never reaches the output
@@ -178,7 +178,8 @@ MMAP_TOTAL      equ 0x12230000           ; through the end of BSSBUF
 ; never touched and cost no memory either.
 BSSBUF_OFF      equ 0xE230000
 BSSBUF_CAP      equ 0x4000000
-MMAP_END        equ 0x12230000           ; BSSBUF_OFF + BSSBUF_CAP
+INCBUF_OFF      equ 0x12230000           ; scratch for one included file at
+INCBUF_CAP      equ 0x1000000            ; a time, before it is spliced in
 
 MAX_JOBS        equ 16
 PAR_MIN_BYTES   equ 262144               ; below ~256 KiB the fork+merge
@@ -295,6 +296,7 @@ CH_RBRACKET     equ 93
 CH_US           equ 95
 CH_a            equ 97
 CH_STAR         equ 42
+CH_PERCENT      equ 37
 CH_BACKSLASH    equ 92
 CH_n            equ 110
 CH_r            equ 114
@@ -516,6 +518,8 @@ jne die_input_too_large        ; not negative and not zero -> read a real
                                ; byte -- input didn't fit in BUF_LEN
 read_done:
 add r12, rbx
+call expand_includes               ; splice included files in before any
+                                    ; parsing, chunking or line counting
 mov r13, rbx
 mov r15, r14
 add r15, HDR_LEN
@@ -1671,6 +1675,208 @@ rf_next:
 add r9, 1
 jmp rf_loop
 rf_done:
+ret
+
+; ===========================================================================
+; expand_includes -- splice every `%include "file"` into the input buffer
+; before anything parses it.
+;
+; Doing this as a textual pre-pass, rather than teaching the parser to
+; switch files, means everything downstream is unchanged: the statement
+; loop, the chunk boundaries the parallel pre-scan computes, and the
+; fixup machinery all keep seeing one flat buffer. Re-scanning from the
+; start after each splice makes nested includes work with no recursion.
+;
+; The cost is that a reported line number counts lines in the expanded
+; text, not in the file the statement was written in. A directive that
+; includes itself is caught by the expansion cap rather than running the
+; buffer out of space.
+;   in/out: r12 = input end (grows as files are spliced in)
+; ===========================================================================
+EXPAND_MAX      equ 4096
+
+expand_includes:
+mov r8, 0                          ; expansions performed
+expand_scan:
+mov r13, rbx                       ; cursor: restart after every splice
+expand_line:
+cmp r13, r12
+jae expand_done
+call skip_ws
+cmp r13, r12
+jae expand_done
+movb rax, [r13+0]
+cmp rax, CH_PERCENT
+je expand_found
+call fast_to_eol
+jmp expand_line
+
+expand_found:
+mov r9, r13                        ; r9 = start of the directive line
+add r13, 1
+call scan_ident
+cmp rcx, 7
+jne die_bad_include
+mov rdi, lit_include
+mov rdx, 7
+call bytes_eq
+cmp rax, 1
+jne die_bad_include
+call skip_ws
+cmp r13, r12
+jae die_bad_include
+movb rax, [r13+0]
+cmp rax, CH_QUOTE
+jne die_bad_include
+add r13, 1
+mov r10, r13                       ; r10 = first byte of the file name
+expand_name:
+cmp r13, r12
+jae die_bad_include
+movb rax, [r13+0]
+cmp rax, CH_QUOTE
+je expand_name_end
+add r13, 1
+jmp expand_name
+expand_name_end:
+mov r11, r13                       ; r11 = one past the name
+add r13, 1
+call fast_to_eol                   ; r13 = start of the line after this one
+
+; NUL-terminate the name in place: the closing quote's byte is free to
+; overwrite, since the whole line is about to be replaced anyway
+push r9
+push r13
+mov rax, 0
+movb [r11+0], rax
+mov rdi, r10
+call read_include                  ; -> rax = bytes read into INCBUF
+pop r13
+pop r9
+
+; --- splice: the directive line becomes the file's contents ---
+mov rdx, rax                       ; new length (the file's size)
+mov rsi, r12
+sub rsi, r13                       ; bytes following the directive
+mov rdi, r9
+add rdi, rdx                       ; where those bytes must end up
+mov r10, rdi
+add r10, rsi
+mov rax, rbx
+add rax, BUF_LEN
+cmp r10, rax
+jae die_input_too_large
+push rdx                           ; mem_move_up consumes rsi as its length
+push rsi                           ; and uses it as scratch, so keep a copy
+mov rax, r13                       ; source of the tail
+call mem_move_up                   ; rax=src rdi=dst rsi=len, copied high
+                                    ; to low so a forward overlap cannot
+                                    ; clobber bytes not yet moved
+pop rsi
+pop rdx
+mov rax, r9
+add rax, rdx
+add rax, rsi
+mov r12, rax                       ; new input end
+
+mov rdi, r9                        ; drop the file's bytes into the gap
+mov rsi, rbx
+add rsi, INCBUF_OFF
+mov rcx, rdx
+call mem_copy
+
+add r8, 1
+cmp r8, EXPAND_MAX
+jae die_include_loop
+jmp expand_scan
+expand_done:
+ret
+
+; read_include -- rdi = NUL-terminated path; reads the whole file into
+; INCBUF. out: rax = length.
+; The running byte count lives in r9, NOT r11: syscall parks RFLAGS in
+; r11 and the return address in rcx, so nothing may ride through a
+; syscall in either. (The caller saves r9 across this call; r8, which
+; holds the expansion counter, is left alone here.)
+read_include:
+mov rsi, O_RDONLY
+mov rax, SYS_open
+syscall
+cmp rax, 0
+jl die_open
+mov r10, rax                       ; fd
+mov r9, 0                          ; bytes so far
+read_include_loop:
+mov rdi, rbx
+add rdi, INCBUF_OFF
+add rdi, r9
+mov rsi, rdi
+mov rdx, INCBUF_CAP
+sub rdx, r9
+cmp rdx, 0
+je die_input_too_large
+mov rdi, r10
+mov rax, SYS_read
+syscall
+cmp rax, 0
+jl die_read
+je read_include_done
+add r9, rax
+jmp read_include_loop
+read_include_done:
+mov rdi, r10
+mov rax, SYS_close
+syscall
+mov rax, r9
+ret
+
+; mem_move_up -- rax = src, rdi = dst, rsi = len, with dst >= src.
+; Copies from the top down so a forward overlap cannot overwrite bytes
+; that have not been moved yet.
+; The regions overlap, and the direction matters: an included file may be
+; longer than the directive line it replaces (tail shifts right) or
+; shorter (tail shifts left). Copying top-down is only safe for a right
+; shift; for a left shift it overwrites source bytes that have not been
+; read yet, and vice versa. Pick the direction from the addresses.
+; Uses only rax/rcx/rdx/rsi/rdi -- r8 must survive, it is the caller's
+; expansion counter.
+mem_move_up:
+cmp rsi, 0
+je mem_move_up_done
+cmp rdi, rax
+jae mem_move_backward
+; --- dst < src: copy lowest byte first ---
+mov rcx, 0
+mem_move_fwd_loop:
+cmp rcx, rsi
+jae mem_move_up_done
+mov rdx, rax
+add rdx, rcx
+push rsi
+movb rsi, [rdx+0]
+mov rdx, rdi
+add rdx, rcx
+movb [rdx+0], rsi
+pop rsi
+add rcx, 1
+jmp mem_move_fwd_loop
+; --- dst >= src: copy highest byte first ---
+mem_move_backward:
+mov rcx, rsi
+mem_move_up_loop:
+cmp rcx, 0
+je mem_move_up_done
+sub rcx, 1
+mov rdx, rax
+add rdx, rcx
+push rsi
+movb rsi, [rdx+0]
+mov rdx, rdi
+add rdx, rcx
+movb [rdx+0], rsi
+pop rsi
+jmp mem_move_up_loop
+mem_move_up_done:
 ret
 
 ; ===========================================================================
@@ -4946,6 +5152,12 @@ jmp die_at_line
 die_resb_section:
 mov rdi, msg_resbsection
 jmp die_at_line
+die_bad_include:
+mov rdi, msg_badinclude
+jmp die_at_line
+die_include_loop:
+mov rdi, msg_includeloop
+jmp die_at_line
 die_disp_range:
 mov rdi, msg_disprange
 jmp die_at_line
@@ -5120,6 +5332,12 @@ db 0
 msg_resbsection:
 db "v1: resb is only valid in .bss"
 db 0
+msg_badinclude:
+db "v1: malformed %include (expected: %include \"file\")"
+db 0
+msg_includeloop:
+db "v1: too many %include expansions (a file including itself?)"
+db 0
 msg_chunk_too_big:
 db "v1: parallel chunk exceeded its slot; retry with fewer jobs"
 db 10
@@ -5292,6 +5510,8 @@ db 0
 ; SWAR+bucketed (see PACK_* constants and parse_stmt_dispatch above).
 lit_equ:
 db "equ"
+lit_include:
+db "include"
 
 ; ===========================================================================
 ; class_tbl -- 256-byte branchless character classification table (bits:

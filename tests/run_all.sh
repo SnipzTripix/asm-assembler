@@ -50,6 +50,9 @@ echo "=== scaled-index addressing ==="
 echo "=== .bss / resb ==="
 ./tests/check_bss.sh "$V" || fail=1
 
+echo "=== %include ==="
+./tests/check_include.sh "$V" || fail=1
+
 echo "=== range / overflow regressions ==="
 ./tests/regress_range.sh "$V"
 
