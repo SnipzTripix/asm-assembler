@@ -164,6 +164,8 @@ DEFLIST_OFF     equ 0xD900000            ; 8 MiB of symbol-slot pointers, one
                                           ; 16 MiB hash table to find them
                                           ; would cost more than the work it
                                           ; just did
+LINE_START_OFF  equ 0xE21FFF0            ; first byte of the current line,
+                                          ; for column numbers in errors
 MEM_INDEX_OFF   equ 0xE220000            ; parse_mem's index register, or
                                           ; NEG_ONE when the operand has none
 MEM_SCALE_OFF   equ 0xE220008            ; SIB scale field (0..3 = 1,2,4,8)
@@ -527,6 +529,9 @@ mov rax, rbx
 add rax, LINE_OFF
 mov rcx, 1
 mov [rax+0], rcx
+mov rax, rbx
+add rax, LINE_START_OFF
+mov [rax+0], r13
 
 ; --- section state: start in .text, remember both cursors ---
 mov rax, rbx
@@ -590,6 +595,9 @@ add rax, LINE_OFF
 mov rcx, [rax+0]
 add rcx, 1
 mov [rax+0], rcx
+mov rax, rbx
+add rax, LINE_START_OFF
+mov [rax+0], r13
 jmp stmt_loop
 comment_line:
 call skip_to_eol
@@ -907,7 +915,10 @@ add rax, LINE_OFF
 mov rcx, [rax+0]
 add rcx, 1
 mov [rax+0], rcx
-pop rax
+mov rax, rbx
+add rax, LINE_START_OFF            ; r13 is just past the newline, i.e. the
+mov [rax+0], r13                   ; first byte of the next line -- kept so
+pop rax                            ; errors can report a column
 skip_to_eol_ret:
 ret
 
@@ -1601,7 +1612,7 @@ mov rsi, [r10+8]                    ; symbol slot address (temp)
 
 mov rdi, [rsi+32]                   ; symbol status
 cmp rdi, 0
-je die_undef_label
+je rf_undef                         ; name the symbol, not just the failure
 mov r11, [rsi+24]                   ; symbol value (relative) -> target
 mov rsi, [rsi+40]                   ; symbol's own section
 
@@ -1676,6 +1687,15 @@ add r9, 1
 jmp rf_loop
 rf_done:
 ret
+
+; rf_undef -- rsi = the unresolved symbol's slot. An undefined label is
+; only discovered here, after the whole file has been scanned, so there
+; is no useful line number left to report -- the name is what identifies
+; it. Falls through to the shared reporter.
+rf_undef:
+mov rcx, [rsi+16]                  ; name_len
+mov rsi, [rsi+8]                   ; name_ptr
+jmp die_undef_named
 
 ; ===========================================================================
 ; expand_includes -- splice every `%include "file"` into the input buffer
@@ -3098,13 +3118,9 @@ add r9, 1
 jmp par_merge_p2
 
 par_merge_undef:
-mov rdi, msg_undef
-call write_cstr_fd2
-mov rdi, msg_nl
-call write_cstr_fd2
-mov rdi, 1
-mov rax, SYS_exit
-syscall
+mov rcx, [rdi+16]
+mov rsi, [rdi+8]
+jmp die_undef_named
 
 par_merge_fin:
 pop rax
@@ -5131,6 +5147,27 @@ jmp die_at_line
 die_undef_label:
 mov rdi, msg_undef
 jmp die_at_line
+
+; die_undef_named -- rsi/rcx = the name that was never defined. Prints
+; "v1: undefined label: NAME" and exits. No line number: by the time
+; fixups are resolved the scan is over, and the name is the useful part.
+die_undef_named:
+push rsi
+push rcx
+mov rdi, msg_undef
+call write_cstr_fd2
+mov rdi, msg_colonsp
+call write_cstr_fd2
+pop rdx                            ; length
+pop rsi                            ; pointer
+mov rdi, 2
+mov rax, SYS_write
+syscall
+mov rdi, msg_nl
+call write_cstr_fd2
+mov rdi, 1
+mov rax, SYS_exit
+syscall
 die_toomany_syms:
 mov rdi, msg_toomanysyms
 jmp die_at_line
@@ -5198,6 +5235,18 @@ call write_cstr_fd2
 mov rax, rbx
 add rax, LINE_OFF
 mov rax, [rax+0]
+call print_udec
+; column, so the message points at the offending token rather than just
+; the line. The cursor has usually stopped exactly where parsing gave up.
+mov rdi, msg_atcol
+call write_cstr_fd2
+mov rax, rbx
+add rax, LINE_START_OFF
+mov rax, [rax+0]
+mov rcx, r13
+sub rcx, rax
+add rcx, 1                         ; columns read naturally from 1
+mov rax, rcx
 call print_udec
 mov rdi, msg_nl
 call write_cstr_fd2
@@ -5347,6 +5396,12 @@ db "v1: displacement out of range"
 db 0
 msg_atline:
 db " at line "
+db 0
+msg_atcol:
+db " col "
+db 0
+msg_colonsp:
+db ": "
 db 0
 msg_nl:
 db 10
