@@ -41,6 +41,9 @@ echo "=== data directives (dw/dd/dq, dq-label jump table) ==="
 echo "=== function-pointer dispatch (dq label + call reg) ==="
 ./tests/check_dispatch.sh "$V" || fail=1
 
+echo "=== db string escapes ==="
+./tests/check_escapes.sh "$V" || fail=1
+
 echo "=== range / overflow regressions ==="
 ./tests/regress_range.sh "$V"
 

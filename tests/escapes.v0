@@ -1,0 +1,22 @@
+; escapes.v0 -- db string escape sequences. Prints:
+;   esc:<tab>X
+;   quote:" back:\
+; then exits 0. Before escapes existed, "\n" in a db string emitted a
+; literal backslash and n, and a newline needed a separate `db 10`.
+.text
+mov rax, 1
+mov rdi, 1
+mov rsi, msg
+mov rdx, msglen
+syscall
+mov rax, 60
+mov rdi, 0
+syscall
+
+.data
+msg:
+db "esc:\tX\nquote:\" back:\\\n"
+msgend:
+
+.text
+msglen equ 22

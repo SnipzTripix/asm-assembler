@@ -274,6 +274,10 @@ CH_LBRACKET     equ 91
 CH_RBRACKET     equ 93
 CH_US           equ 95
 CH_a            equ 97
+CH_BACKSLASH    equ 92
+CH_n            equ 110
+CH_r            equ 114
+CH_t            equ 116
 CH_x            equ 120
 CH_zPLUS1       equ 123
 CH_fPLUS1       equ 103
@@ -4018,6 +4022,12 @@ add r15, 1
 jmp do_db_tail
 
 do_db_string:
+; Escape sequences: \n \t \r \0 \\ \" . Until these existed, "hi\n" put a
+; literal backslash and n in the output, so every program that wanted a
+; newline had to append it with a separate `db 10` -- which is exactly
+; what the test programs did, and why their output read "hello, seed\n".
+; An unrecognised escape is an error rather than a silently-kept
+; backslash: guessing is how "\d" quietly becomes two bytes nobody meant.
 add r13, 1
 do_db_copy:
 cmp r13, r12
@@ -4025,10 +4035,51 @@ jae die_bad_operand
 movb rax, [r13+0]
 cmp rax, CH_QUOTE
 je do_db_close
+cmp rax, CH_BACKSLASH
+je do_db_escape
 movb [r15+0], rax
 add r15, 1
 add r13, 1
 jmp do_db_copy
+
+do_db_escape:
+add r13, 1
+cmp r13, r12
+jae die_bad_operand
+movb rax, [r13+0]
+cmp rax, CH_n
+je do_db_esc_nl
+cmp rax, CH_t
+je do_db_esc_tab
+cmp rax, CH_r
+je do_db_esc_cr
+cmp rax, CH_0
+je do_db_esc_nul
+cmp rax, CH_BACKSLASH
+je do_db_esc_self
+cmp rax, CH_QUOTE
+je do_db_esc_self
+jmp die_bad_escape
+do_db_esc_nl:
+mov rax, 10
+jmp do_db_esc_put
+do_db_esc_tab:
+mov rax, 9
+jmp do_db_esc_put
+do_db_esc_cr:
+mov rax, 13
+jmp do_db_esc_put
+do_db_esc_nul:
+mov rax, 0
+jmp do_db_esc_put
+do_db_esc_self:
+movb rax, [r13+0]                  ; \\ and \" stand for themselves
+do_db_esc_put:
+movb [r15+0], rax
+add r15, 1
+add r13, 1
+jmp do_db_copy
+
 do_db_close:
 add r13, 1
 do_db_tail:
@@ -4528,6 +4579,9 @@ jmp die_at_line
 die_imm_range:
 mov rdi, msg_immrange
 jmp die_at_line
+die_bad_escape:
+mov rdi, msg_badescape
+jmp die_at_line
 die_disp_range:
 mov rdi, msg_disprange
 jmp die_at_line
@@ -4689,6 +4743,9 @@ db "v1: too many fixups"
 db 0
 msg_immrange:
 db "v1: immediate out of range"
+db 0
+msg_badescape:
+db "v1: unknown escape sequence in string"
 db 0
 msg_chunk_too_big:
 db "v1: parallel chunk exceeded its slot; retry with fewer jobs"

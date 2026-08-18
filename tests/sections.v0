@@ -6,7 +6,7 @@
 mov rax, 1
 mov rdi, 1
 mov rsi, msg
-mov rdx, 14
+mov rdx, 13              ; "in .data now" + a real newline
 syscall
 mov rax, 60
 mov rdi, 0

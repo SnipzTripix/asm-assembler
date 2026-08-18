@@ -1,12 +1,13 @@
-; hello.v0 -- prints "hello, seed\n" (13 literal bytes -- no escape
-; processing in this dialect, so \n is the two characters backslash,n)
-; and exits 0. Uses a label for the message address (resolved via the
-; ABS64 fixup mechanism) rather than a hand-computed absolute address,
-; which broke the first time HDR_LEN changed size.
+; hello.v0 -- prints "hello, seed" and a newline, then exits 0.
+; The message address comes from a label (resolved by the ABS64 fixup
+; mechanism) rather than a hand-computed absolute address, which broke
+; the first time the header changed size. The newline is a real \n now
+; that db understands escapes; it used to be a literal backslash-n, which
+; is why this program's output read "hello, seed\n" for so long.
 mov rax, 1            ; sys_write
 mov rdi, 1             ; fd = stdout
 mov rsi, msg            ; addr of msg
-mov rdx, 13              ; length
+mov rdx, 12              ; length
 syscall
 mov rax, 60               ; sys_exit
 mov rdi, 0
