@@ -17,6 +17,7 @@ interaction is a direct `syscall`.
 ```
 ./v1 program.v0 program && ./program        # argv-based
 ./v1 < program.v0 > program && chmod +x program && ./program   # stdin/stdout
+./v1 -f elf64 program.v0 program.o && ld -o program program.o  # object file
 ```
 
 `program.v0` is written in the dialect described below. The output is a
@@ -82,7 +83,8 @@ the dialect grows, so it's the source of truth, not this file. Briefly:
 - `.text`/`.data`/`.bss` — real ELF segments: R+X, R, and a
   zero-filled RW mapping that costs nothing in the file
 - `%include "file"`, nesting supported
-- filenames as argv[1]/argv[2], worker count as argv[3]
+- `global NAME` / `extern NAME` for object output
+- `[-f elf64]`, then filenames, then a worker count
 
 Not yet implemented: arithmetic at widths other than 64-bit (memory
 access has `movb`/`movw`/`movd`; the ALU ops are always full-width),
@@ -106,6 +108,49 @@ zero because `mod=00` means something else for them. Every one of those
 choices is checked against GNU `as` across all 16 bases, four index
 registers and the values `0, ±1, ±127, ±128, ±129, 255, -32768` — the
 boundaries where the `mod` bits and the `rbp`/`rsp` escapes interact.
+
+## Object files
+
+```
+./v1 -f elf64 a.v0 a.o
+./v1 -f elf64 b.v0 b.o
+ld -o prog a.o b.o
+```
+
+Without this, `v1` was a fast and careful assembler for a language only
+this project writes: its output had no section headers, no symbols and
+no relocations, so `ld` could not link it, `nm` and `objdump` had nothing
+to read, and multi-file projects meant textual `%include`. `-f elf64`
+emits a normal `ET_REL` object — `.text`/`.data`/`.bss`,
+`.symtab`/`.strtab`, `.rela.text`/`.rela.data` — that links against
+objects from other assemblers, and vice versa.
+
+`global NAME` exports a symbol; `extern NAME` says it lives elsewhere, so
+a reference becomes a relocation instead of an error. `extern` is refused
+for flat output rather than ignored: a flat binary has no relocations, so
+the reference could only ever resolve to address zero.
+
+Most of this already existed. Labels have carried a section-relative
+value and a section id since sections were added, fixups already record
+which section they patch and which symbol they want, and the list of
+declared symbols is already kept in source order — so nothing has to be
+sorted, and symbol and relocation order is deterministic for free. What
+is new is the file layout and the decision *not* to resolve label
+fixups, which is what makes the output relocatable.
+
+Two things deliberately don't appear. `equ` constants are compile-time
+values rather than addresses, so a fixup naming one is still resolved in
+place — emitting them as `SHN_ABS` symbols would invite a linker to
+relocate a number. And there is no debug information at all: `nm` and
+`objdump -dr` work, `gdb` will not show you a source line.
+
+The strongest test of it is that the assembler survives a round trip
+through somebody else's linker:
+
+```
+./v1 -f elf64 v1.v0 v1.o && ld -e start -o v1_linked v1.o
+./v1_linked v1.v0 out && cmp out v1     # byte-identical
+```
 
 ## Parallel assembly
 

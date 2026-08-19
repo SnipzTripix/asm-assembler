@@ -56,6 +56,9 @@ echo "=== %include ==="
 echo "=== review regressions ==="
 ./tests/check_review.sh "$V" || fail=1
 
+echo "=== -f elf64 object output ==="
+./tests/check_elf64.sh "$V" || fail=1
+
 echo "=== a worker count never breaks a build ==="
 ./tests/check_par_fallback.sh "$V" || fail=1
 

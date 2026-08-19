@@ -1390,6 +1390,18 @@ do_syscall:
 ; ---------------------------------------------------------------------------
 ; do_ret -- RET (near), opcode C3 (SDM Vol2)
 ; ---------------------------------------------------------------------------
+; ---------------------------------------------------------------------------
+; do_global -- `global NAME` marks a symbol as exported from an ELF
+; object. seed only ever emits flat binaries, where visibility has
+; nowhere to be recorded, so the directive is consumed and discarded.
+; It exists here at all because seed has to be able to assemble v1.v0,
+; and v1.v0 declares its own entry point global so that `ld -e start`
+; can find it in the object v1 produces for itself.
+; ---------------------------------------------------------------------------
+do_global:
+    call    skip_to_eol
+    ret
+
 do_ret:
     mov     byte [r15], 0xC3
     inc     r15
@@ -1739,6 +1751,7 @@ lit_call:    db "call"
 lit_push:    db "push"
 lit_pop:     db "pop"
 lit_imul:    db "imul"
+lit_global:  db "global"
 
 align 8
 mnem_table:
@@ -1770,6 +1783,7 @@ mnem_table:
     dq lit_push,    4, do_push
     dq lit_pop,     3, do_pop
     dq lit_imul,    4, do_imul
+    dq lit_global,  6, do_global
     dq 0, 0, 0
 
 file_size equ $ - $$

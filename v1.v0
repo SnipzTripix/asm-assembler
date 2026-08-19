@@ -57,10 +57,20 @@
 ;            the default, so source that mentions none of them behaves
 ;            exactly as it did before sections existed
 ;   %include "file"    spliced in textually before parsing; nests
+;   global NAME        export the symbol from an object; ignored when the
+;            output is a flat executable, which has nowhere to record it
+;   extern NAME        the symbol is defined in some other object, so a
+;            reference to it becomes a relocation rather than an error.
+;            Refused unless -f elf64: a flat binary has no relocations,
+;            so the reference could only ever resolve to zero
 ;
-; Invocation: filenames as argv[1]/argv[2] (the output gets mode 0755),
-; each falling back to stdin/stdout, and argv[3] as a worker count for
-; parallel assembly.
+; Invocation: [-f elf64] then filenames as argv[1]/argv[2] (a flat
+; executable gets mode 0755, an object 0644), each falling back to
+; stdin/stdout, and a worker count for parallel assembly as the last
+; argument. -f elf64 produces a relocatable object -- .text/.data/.bss,
+; .symtab/.strtab and .rela.text/.rela.data -- which ld links and nm and
+; objdump read. It carries no debug information, and it always runs
+; serially (see par_size_ok).
 ;
 ; Range checking: values that cannot fit the field they are headed for
 ; are hard errors ("immediate out of range", "displacement out of
@@ -109,6 +119,7 @@ SYS_wait4       equ 61
 O_RDONLY        equ 0
 O_WRONLY_CREAT_TRUNC equ 577       ; O_WRONLY(1)|O_CREAT(64)|O_TRUNC(512)
 MODE_755        equ 493            ; rwxr-xr-x
+MODE_644        equ 420            ; rw-r--r-- -- an object is not run
 MAP_SHARED_ANON equ 0x21           ; MAP_SHARED(1)|MAP_ANONYMOUS(0x20)
 PROT_RW         equ 3
 MAP_ANON        equ 0x22
@@ -153,6 +164,8 @@ INPUT_FD_OFF    equ 0xD800028            ; argv[1]-opened fd, else 0 (stdin)
 OUTPUT_FD_OFF   equ 0xD800030            ; 1 (stdout) until the real file is
                                           ; opened, which happens only once
                                           ; there is output to write
+OUTFMT_OFF      equ 0xD800508            ; 0 = flat ELF executable,
+                                          ; 1 = ET_REL object (-f elf64)
 OUTPATH_OFF     equ 0xD800500            ; argv[2], or 1 when writing stdout.
                                           ; Must stay clear of CHUNKTAB, which
                                           ; spans MAX_JOBS * CHUNK_ENT bytes
@@ -211,7 +224,42 @@ MEM_SCALE_OFF   equ 0xE220008            ; SIB scale field (0..3 = 1,2,4,8)
 SAVED_BSS_R15_OFF equ 0xE220010          ; .bss cursor while inactive
 BSS_VADDR_OFF   equ 0xE220018            ; where .bss lands in memory,
                                           ; relative to LOAD_BASE
-MMAP_TOTAL      equ 0x13230000           ; through the end of INCBUF
+; --- object output (-f elf64) scratch. Only touched on that path, and
+; lazily mapped like everything else here, so a flat build never pays a
+; page for any of it. ---
+OBJ_SYM_OFF     equ 0x13230000           ; 8 MiB / 24 B per Elf64_Sym; the
+                                          ; symbol table cannot exceed
+                                          ; SYM_POP_MAX entries, so this
+                                          ; cannot overflow
+OBJ_STR_OFF     equ 0x13A30000           ; 8 MiB of .strtab bytes
+OBJ_STR_CAP     equ 0x800000
+OBJ_RELT_OFF    equ 0x14230000           ; 8 MiB / 24 B per Elf64_Rela, and
+OBJ_RELD_OFF    equ 0x14A30000           ; FIX_CAP is 200000, so neither
+                                          ; .rela section can overrun even
+                                          ; if every fixup lands in it
+OBJ_SHDR_OFF    equ 0x15230000           ; OBJ_NSEC * 64
+OBJ_ZERO_OFF    equ 0x15231000           ; never written: a page of zeros to
+                                          ; pad file offsets into alignment
+OBJ_TEXTSZ_OFF  equ 0x15232000
+OBJ_DATASZ_OFF  equ 0x15232008
+OBJ_BSSSZ_OFF   equ 0x15232010
+OBJ_NSYM_OFF    equ 0x15232018
+OBJ_NLOCAL_OFF  equ 0x15232020
+OBJ_STRSZ_OFF   equ 0x15232028
+OBJ_NRELT_OFF   equ 0x15232030
+OBJ_NRELD_OFF   equ 0x15232038
+OBJ_OFF_TEXT    equ 0x15232040           ; file offsets, all computed once
+OBJ_OFF_DATA    equ 0x15232048           ; in emit_object and read back by
+OBJ_OFF_RELT    equ 0x15232050           ; the section-header builder
+OBJ_OFF_RELD    equ 0x15232058
+OBJ_OFF_SYM     equ 0x15232060
+OBJ_OFF_STR     equ 0x15232068
+OBJ_OFF_SHSTR   equ 0x15232070
+OBJ_OFF_SHDR    equ 0x15232078
+
+MMAP_TOTAL      equ 0x15240000           ; through the end of the object
+                                          ; scratch (INCBUF ends at
+                                          ; 0x13230000)
 
 ; .bss gets a real buffer like the other sections, so r15 and every label
 ; and emitter work there unchanged -- it simply never reaches the output
@@ -305,6 +353,43 @@ SYM_ENT         equ 64                  ; power of 2 slot stride: {hash:8,
                                          ; name_ptr:8, name_len:8, value:8,
                                          ; status:8, section:8, 16B pad}
 SYM_CAP         equ 262144              ; power of 2 -- and'd, never mod'd
+SYM_EXTERN      equ 3                   ; status: declared, defined elsewhere
+SYMB_LOCAL      equ 0                   ; binding, in the slot's spare bytes
+SYMB_GLOBAL     equ 1
+OUTFMT_FLAT     equ 0
+OUTFMT_OBJECT   equ 1
+
+; --- ELF section/symbol/relocation constants, SysV gABI + x86-64 psABI ---
+OBJ_NSEC        equ 9                   ; NULL .text .data .bss .symtab
+                                         ; .strtab .rela.text .rela.data
+                                         ; .shstrtab -- always all nine, even
+                                         ; when empty, so section indices are
+                                         ; constants instead of a running
+                                         ; count that has to agree with a
+                                         ; second one somewhere else
+SEC_IDX_TEXT    equ 1
+SEC_IDX_DATA    equ 2
+SEC_IDX_BSS     equ 3
+SEC_IDX_SYMTAB  equ 4
+SEC_IDX_STRTAB  equ 5
+SEC_IDX_SHSTR   equ 8
+SHT_PROGBITS    equ 1
+SHT_SYMTAB      equ 2
+SHT_STRTAB      equ 3
+SHT_RELA        equ 4
+SHT_NOBITS      equ 8
+SHF_WRITE       equ 1
+SHF_ALLOC       equ 2
+SHF_EXEC        equ 4
+SHDR_ENT        equ 64
+SYMENT          equ 24
+RELAENT         equ 24
+STB_LOCAL_INFO  equ 0                    ; st_info = bind<<4 | type, and the
+STB_GLOBAL_INFO equ 16                   ; type stays STT_NOTYPE throughout
+SHN_UNDEF       equ 0
+R_X86_64_64     equ 1
+R_X86_64_PC32   equ 2
+SHSTR_LEN       equ 66                   ; the fixed .shstrtab blob below
 SYM_CAP_MASK    equ 262143
 SEC_TEXT        equ 0
 SEC_DATA        equ 1
@@ -334,6 +419,8 @@ SWAR_HIGHS      equ 0x8080808080808080
 ; correct for both mov (which keeps all 64 bits) and cmp (which keeps only
 ; the low 32, then the CPU re-extends them identically) ---
 NEG_ONE         equ 0xFFFFFFFFFFFFFFFF
+NEG_FOUR        equ 0xFFFFFFFFFFFFFFFC
+ALIGN8_MASK     equ 0xFFFFFFFFFFFFFFF8
 MMAP_ERR_THRESH equ 0xFFFFFFFFFFFFF001
 
 ; --- ASCII codes (dialect has no character-literal syntax) ---
@@ -352,6 +439,7 @@ CH_DOT          equ 46
 CH_PLUS         equ 43
 CH_COMMA        equ 44
 CH_MINUS        equ 45
+CH_f            equ 102
 CH_0            equ 48
 CH_9PLUS1       equ 58
 CH_COLON        equ 58
@@ -413,6 +501,10 @@ PACK_DD         equ 0x6464
 PACK_DQ         equ 0x7164
 PACK_BSS        equ 0x737362
 PACK_RESB       equ 0x62736572
+PACK_GLOBAL     equ 0x6C61626F6C67
+PACK_EXTERN     equ 0x6E7265747865
+PACK_ELF64      equ 0x3436666C65         ; "elf64" plus its NUL, the only
+                                         ; argument -f accepts
 
 ; --- and the register names, packed the same way. Ordered by how often
 ; each register actually appears in v1.v0, which is the only workload
@@ -440,6 +532,11 @@ PACK_R9         equ 0x3972
 ; entry point -- mmap the working set, read all of stdin, parse, resolve
 ; fixups, build the output ELF header, write it out, exit.
 ; ===========================================================================
+global start                        ; a no-op for the flat executable, whose
+                                    ; entry point is simply the start of
+                                    ; .text; it matters for `-f elf64
+                                    ; v1.v0`, where `ld -e start` has to be
+                                    ; able to find the entry by name
 start:
 ; --- optional argv[1]/argv[2] as input/output filenames, read before any
 ; push/call shifts rsp away from the exact SysV entry layout: [rsp]=argc,
@@ -451,13 +548,54 @@ start:
 ; memory.
 mov r13, 0                          ; input_fd, default stdin
 mov r14, 1                          ; output_fd, default stdout
+mov r9, 0                           ; output format: 0 = flat executable
+mov r10, 16                         ; byte offset of the input filename in
+                                    ; the argv array; "-f elf64" pushes
+                                    ; every following argument along by two
+
+; --- optional leading "-f elf64", compared inline rather than through a
+; call: rsp still has to be the exact value the kernel handed over, and a
+; call would push a return address onto it.
+mov rax, [rsp+0]
+cmp rax, 3
+jl start_have_format
+mov rsi, [rsp+16]
+movb rcx, [rsi+0]
+cmp rcx, CH_MINUS
+jne start_have_format
+movb rcx, [rsi+1]
+cmp rcx, CH_f
+jne start_have_format
+movb rcx, [rsi+2]
+cmp rcx, 0
+jne start_have_format
+mov rsi, [rsp+24]                   ; the only format word accepted; argv
+mov rcx, [rsi+0]                    ; strings sit next to each other, so
+mov rdx, 0xFFFFFFFFFFFF             ; reading 8 bytes of a 6-byte one is
+and rcx, rdx                        ; still reading mapped memory
+mov rdx, PACK_ELF64
+cmp rcx, rdx
+jne die_bad_format
+mov r9, 1                           ; ET_REL object output
+mov r10, 32
+start_have_format:
+
 mov rax, [rsp+0]                    ; argc
-cmp rax, 2
+mov rcx, r10
+shr rcx, 3                          ; [rsp+r10] is argv[(r10/8)-1], so this
+                                    ; is exactly the argc needed for it to
+cmp rax, rcx                        ; exist
 jl start_check_output
-mov rdi, [rsp+16]                   ; argv[1]
+mov rdi, rsp
+add rdi, r10
+mov rdi, [rdi+0]                    ; input filename
 mov rsi, O_RDONLY
+push r9                             ; open clobbers rcx and r11, and the
+push r10                            ; format/offset pair has to survive it
 mov rax, SYS_open
 syscall
+pop r10
+pop r9
 cmp rax, 0
 jl die_open
 mov r13, rax
@@ -468,18 +606,28 @@ start_check_output:
 ; like a successful build.
 mov rax, [rsp+0]                    ; reload argc -- open's return value
                                     ; just clobbered rax
-cmp rax, 3
+mov rcx, r10
+shr rcx, 3
+add rcx, 1
+cmp rax, rcx
 jl start_argv_done
-mov r14, [rsp+24]                   ; argv[2] path, opened at write time
+mov r14, rsp
+add r14, r10
+mov r14, [r14+8]                    ; output path, opened at write time
 start_argv_done:
 ; argv[3] = worker count (default 1 = the original serial path). Parsed
 ; here, before mmap, and stashed in r11 -- the private region it will
 ; live in does not exist yet.
 mov r11, 1
 mov rax, [rsp+0]
-cmp rax, 4
+mov rcx, r10
+shr rcx, 3
+add rcx, 2
+cmp rax, rcx
 jl start_jobs_done
-mov rsi, [rsp+32]                   ; argv[3]
+mov rsi, rsp
+add rsi, r10
+mov rsi, [rsi+16]                   ; worker count
 mov r11, 0
 start_jobs_digit:
 movb rax, [rsi+0]
@@ -508,6 +656,9 @@ start_jobs_bad:
 mov r11, 1
 start_jobs_done:
 
+push r9                             ; the output format, which mmap is
+                                    ; about to overwrite: r9 is its sixth
+                                    ; argument
 mov rdi, 0
 mov rsi, MMAP_TOTAL
 mov rdx, PROT_RW
@@ -518,9 +669,10 @@ push r11                            ; syscall clobbers rcx and r11 (it
 mov rax, SYS_mmap                   ; parks the return address and RFLAGS
 syscall                             ; there) -- the job count cannot ride
 pop r11                             ; through in r11, and when it did, the
-cmp rax, MMAP_ERR_THRESH            ; garbage left behind made every run
-jae die_mmap                        ; think it should fork, which is a
-mov rbx, rax                        ; fork bomb, not a bug you debug twice
+pop r9                              ; garbage left behind made every run
+cmp rax, MMAP_ERR_THRESH            ; think it should fork, which is a
+jae die_mmap                        ; fork bomb, not a bug you debug twice
+mov rbx, rax
 
 mov rax, rbx
 add rax, INPUT_FD_OFF
@@ -535,6 +687,9 @@ mov [rax+0], rcx
 mov rax, rbx
 add rax, JOBS_OFF
 mov [rax+0], r11
+mov rax, rbx
+add rax, OUTFMT_OFF
+mov [rax+0], r9
 mov rax, rbx
 add rax, MYJOB_OFF                  ; the parent is not a worker; workers
 mov rcx, NEG_ONE                    ; overwrite this with their index
@@ -677,6 +832,20 @@ add rax, JOBS_OFF
 mov rcx, 1
 mov [rax+0], rcx
 par_size_ok:
+; Object output is serial. The merge does not rebuild the parent's
+; DEFLIST, and the object's symbol table is generated from it in source
+; order; making the merge maintain it is a great deal of machinery for a
+; path where throughput is not what anyone came for.
+mov rax, rbx
+add rax, OUTFMT_OFF
+mov rax, [rax+0]
+cmp rax, OUTFMT_OBJECT
+jne par_jobs_ok
+mov rax, rbx
+add rax, JOBS_OFF
+mov rcx, 1
+mov [rax+0], rcx
+par_jobs_ok:
 mov rax, rbx
 add rax, JOBS_OFF
 mov rax, [rax+0]
@@ -729,11 +898,892 @@ mov rax, [rax+0]
 cmp rax, NEG_ONE
 jne par_worker_emit
 
+mov rax, rbx                        ; an object leaves its label references
+add rax, OUTFMT_OFF                 ; to the linker instead of settling
+mov rax, [rax+0]                    ; them here -- that is what makes it
+cmp rax, OUTFMT_OBJECT              ; relocatable
+je emit_object
+
 call resolve_fixups                 ; also finalizes both section sizes
                                     ; and DATA_FILE_START -- read those
                                     ; back out instead of trusting live
                                     ; r15, which may currently be in
                                     ; whichever section wasn't scanned last
+jmp build_output                    ; explicit: this used to fall through on
+                                    ; textual adjacency alone, so inserting
+                                    ; a routine above build_output silently
+                                    ; redirected every flat build into it
+
+; ===========================================================================
+; -f elf64 -- write a relocatable object instead of a runnable program.
+;
+; This is the difference between an assembler for a language only this
+; project writes and one whose output the rest of the toolchain can
+; consume: ld, nm, objdump and gdb all speak ET_REL, and none of them can
+; do anything with a flat executable that has no section headers.
+;
+; Almost all the machinery already existed. Labels have carried a
+; section-relative value and a section id since sections were added,
+; fixups already record which section they patch and which symbol they
+; want, and DEFLIST already lists every symbol this process declared in
+; source order -- so symbol and relocation order is deterministic without
+; sorting anything. What is new is the file layout, and the decision NOT
+; to resolve label fixups: in an object they become relocations and the
+; linker settles them.
+;
+; Two things deliberately do not appear in the object. `equ` constants
+; are compile-time values, not addresses, so a fixup naming one is still
+; resolved in place here exactly as it is for a flat binary -- emitting
+; them as SHN_ABS symbols would invite a linker to relocate a number.
+; And there is no debug information of any kind; `nm` and `objdump -dr`
+; work, `gdb` will not show you a source line.
+;
+; Object output runs serially. The parallel merge does not populate
+; DEFLIST in the parent, and forcing serial is a great deal simpler than
+; making it, for a path where throughput is not the point.
+; ===========================================================================
+emit_object:
+mov rax, rbx
+add rax, CUR_SECTION_OFF
+mov rdx, [rax+0]
+call sec_cursor_slot               ; park whichever cursor is live, exactly
+mov [rax+0], r15                   ; as resolve_fixups does
+
+mov rax, rbx
+add rax, SAVED_TEXT_R15_OFF
+mov rax, [rax+0]
+mov rcx, r14
+add rcx, HDR_LEN                   ; an object has no program headers, so
+sub rax, rcx                       ; .text starts where the code does
+mov rcx, rbx
+add rcx, OBJ_TEXTSZ_OFF
+mov [rcx+0], rax
+
+mov rax, rbx
+add rax, SAVED_DATA_R15_OFF
+mov rax, [rax+0]
+mov rcx, rbx
+add rcx, DATABUF_OFF
+sub rax, rcx
+mov rcx, rbx
+add rcx, OBJ_DATASZ_OFF
+mov [rcx+0], rax
+
+mov rax, rbx
+add rax, SAVED_BSS_R15_OFF
+mov rax, [rax+0]
+mov rcx, rbx
+add rcx, BSSBUF_OFF
+sub rax, rcx
+mov rcx, rbx
+add rcx, OBJ_BSSSZ_OFF
+mov [rcx+0], rax
+
+call obj_symbols
+call obj_relocs
+call obj_offsets
+call obj_shdrs
+call obj_ehdr
+call obj_write_file
+mov rdi, 0
+mov rax, SYS_exit
+syscall
+
+; ===========================================================================
+; obj_symbols -- fill .symtab and .strtab from DEFLIST.
+;
+; Index 0 is the reserved all-zero symbol and index 0 of .strtab is the
+; empty name; both are already correct because the arena is a fresh
+; anonymous mapping. Locals are emitted before globals because sh_info
+; must be the index of the first global, which is only a meaningful
+; number if the two groups do not interleave.
+; ===========================================================================
+obj_symbols:
+mov rax, rbx
+add rax, OBJ_STRSZ_OFF
+mov rcx, 1                         ; strtab[0] is the NUL of the empty name
+mov [rax+0], rcx
+mov rax, rbx
+add rax, OBJ_NSYM_OFF
+mov [rax+0], rcx                   ; symbol 0 is the reserved entry
+
+mov rcx, SYMB_LOCAL
+call obj_emit_bind
+mov rax, rbx
+add rax, OBJ_NSYM_OFF
+mov rax, [rax+0]
+mov rcx, rbx
+add rcx, OBJ_NLOCAL_OFF
+mov [rcx+0], rax                   ; sh_info: everything from here is global
+mov rcx, SYMB_GLOBAL
+call obj_emit_bind
+ret
+
+; obj_emit_bind -- rcx = the binding to emit on this pass
+obj_emit_bind:
+mov rax, rbx
+add rax, DEFLIST_META_OFF
+mov r8, [rax+0]
+mov r9, 0
+oeb_loop:
+cmp r9, r8
+jae oeb_done
+mov rax, r9
+shl rax, 3
+mov rdx, rbx
+add rdx, DEFLIST_OFF
+add rax, rdx
+mov rax, [rax+0]                   ; symbol slot
+mov rdx, [rax+48]                  ; binding
+cmp rdx, rcx
+jne oeb_next
+push rcx
+push r8
+push r9
+call obj_emit_sym
+pop r9
+pop r8
+pop rcx
+oeb_next:
+add r9, 1
+jmp oeb_loop
+oeb_done:
+ret
+
+; obj_emit_sym -- rax = symbol slot. Appends one Elf64_Sym plus its name,
+; and records the object index back into the slot so the relocation pass
+; can find it without a second lookup.
+obj_emit_sym:
+mov r10, rax
+mov rax, rbx
+add rax, OBJ_NSYM_OFF
+mov r11, [rax+0]                   ; this symbol's index
+mov rcx, r11
+add rcx, 1
+mov [rax+0], rcx
+mov [r10+56], r11
+
+; --- the name, into .strtab ---
+mov rax, rbx
+add rax, OBJ_STRSZ_OFF
+mov rdx, [rax+0]                   ; st_name = current end of .strtab
+push rdx
+mov rcx, [r10+16]                  ; name_len
+mov rsi, rdx
+add rsi, rcx
+add rsi, 1
+cmp rsi, OBJ_STR_CAP
+jae die_toomany_syms
+mov [rax+0], rsi                   ; new end, name plus its NUL
+mov rdi, rbx
+add rdi, OBJ_STR_OFF
+add rdi, rdx
+mov rsi, [r10+8]                   ; name_ptr, into the input buffer
+oes_copy:
+cmp rcx, 0
+je oes_copied
+movb rax, [rsi+0]
+movb [rdi+0], rax
+add rsi, 1
+add rdi, 1
+sub rcx, 1
+jmp oes_copy
+oes_copied:
+mov rax, 0
+movb [rdi+0], rax
+
+; --- the Elf64_Sym: name(4) info(1) other(1) shndx(2) value(8) size(8) ---
+mov rax, r11
+mov rcx, SYMENT
+imul rax, rcx
+mov rcx, rbx
+add rcx, OBJ_SYM_OFF
+add rax, rcx
+mov rdi, rax
+pop rax                            ; st_name
+push rdi
+call store_dword
+pop rdi
+
+mov rax, [r10+48]
+cmp rax, SYMB_GLOBAL
+je oes_global
+mov rax, STB_LOCAL_INFO
+jmp oes_info
+oes_global:
+mov rax, STB_GLOBAL_INFO
+oes_info:
+movb [rdi+4], rax
+
+mov rax, [r10+32]                  ; status
+cmp rax, SYM_EXTERN
+je oes_undef
+mov rax, [r10+40]                  ; section
+mov rdx, [r10+24]                  ; section-relative value
+cmp rax, SEC_TEXT
+je oes_text
+cmp rax, SEC_BSS
+je oes_bss
+mov rax, SEC_IDX_DATA
+jmp oes_have
+oes_bss:
+mov rax, SEC_IDX_BSS
+jmp oes_have
+oes_text:
+sub rdx, HDR_LEN                   ; .text values are stored relative to the
+mov rax, SEC_IDX_TEXT              ; executable header area an object lacks
+jmp oes_have
+oes_undef:
+mov rax, SHN_UNDEF
+mov rdx, 0
+oes_have:
+movb [rdi+6], rax
+shr rax, 8
+movb [rdi+7], rax
+mov [rdi+8], rdx
+ret
+
+; ===========================================================================
+; obj_relocs -- every fixup becomes either a relocation or, for an `equ`
+; constant, the same in-place patch a flat build would have made.
+; ===========================================================================
+obj_relocs:
+mov rax, rbx
+add rax, FIXUPS_META_OFF
+mov r8, [rax+0]
+mov r9, 0
+orl_loop:
+cmp r9, r8
+jae orl_done
+mov r10, r9
+shl r10, 5
+mov rax, rbx
+add rax, FIXUPS_OFF
+add r10, rax                       ; r10 = fixup record
+
+mov rsi, [r10+8]                   ; symbol slot
+mov rax, [rsi+32]                  ; status
+cmp rax, 0
+je orl_undef                       ; never defined and never declared
+cmp rax, 2
+je orl_const
+push r8
+push r9
+call obj_add_rela
+pop r9
+pop r8
+jmp orl_next
+orl_const:
+push r8
+push r9
+call obj_const_fixup
+pop r9
+pop r8
+orl_next:
+add r9, 1
+jmp orl_loop
+orl_done:
+ret
+orl_undef:
+mov rcx, [rsi+16]                  ; length first: rsi is about to become
+mov rsi, [rsi+8]                   ; the name pointer
+jmp die_undef_named
+
+; obj_add_rela -- r10 = fixup record. Appends an Elf64_Rela to whichever
+; .rela section matches the patch site.
+obj_add_rela:
+mov rax, [r10+0]                   ; patch offset within its section
+mov rdx, [r10+24]                  ; the patched section
+cmp rdx, SEC_TEXT
+je oar_text
+mov rdi, rbx
+add rdi, OBJ_RELD_OFF
+mov rsi, rbx
+add rsi, OBJ_NRELD_OFF
+jmp oar_have
+oar_text:
+sub rax, HDR_LEN
+mov rdi, rbx
+add rdi, OBJ_RELT_OFF
+mov rsi, rbx
+add rsi, OBJ_NRELT_OFF
+oar_have:
+mov rdx, [rsi+0]
+mov rcx, rdx
+add rcx, 1
+mov [rsi+0], rcx
+mov rcx, RELAENT
+imul rdx, rcx
+add rdi, rdx                       ; rdi = the new Elf64_Rela
+mov [rdi+0], rax                   ; r_offset
+
+mov rsi, [r10+8]
+mov rax, [rsi+56]                  ; the object symbol index
+shl rax, 32                        ; r_info = sym << 32 | type
+mov rcx, [r10+16]                  ; kind
+cmp rcx, FIX_ABS64
+je oar_abs
+add rax, R_X86_64_PC32
+mov [rdi+8], rax
+mov rax, NEG_FOUR                  ; the field ends four bytes before the
+mov [rdi+16], rax                  ; next instruction, and PC32 is measured
+ret                                ; from the field's own address
+oar_abs:
+add rax, R_X86_64_64
+mov [rdi+8], rax
+mov rax, 0
+mov [rdi+16], rax
+ret
+
+; obj_const_fixup -- r10 = fixup record, rsi = the constant's slot. A
+; forward reference that turned out to name an `equ` is a value, not an
+; address: it is written straight into the field and no relocation is
+; emitted, which is the object-file version of rf_abs_nobias.
+obj_const_fixup:
+mov rax, [r10+16]
+cmp rax, FIX_ABS64
+jne die_rel_const
+mov r11, [rsi+24]                  ; the constant's value
+mov rax, [r10+0]
+mov rdx, [r10+24]
+cmp rdx, SEC_TEXT
+je ocf_text
+mov rdi, rbx
+add rdi, DATABUF_OFF
+jmp ocf_have
+ocf_text:
+mov rdi, r14
+ocf_have:
+add rdi, rax
+mov [rdi+0], r11
+ret
+
+; ===========================================================================
+; obj_offsets -- lay the file out. Everything after .data is 8-byte
+; aligned because relocation and symbol entries are read as 8-byte fields
+; and .text/.data sizes are arbitrary.
+; ===========================================================================
+obj_offsets:
+mov r8, 64                         ; sizeof(Elf64_Ehdr)
+mov rax, rbx
+add rax, OBJ_OFF_TEXT
+mov [rax+0], r8
+
+mov rax, rbx
+add rax, OBJ_TEXTSZ_OFF
+mov rax, [rax+0]
+add r8, rax
+mov rax, rbx
+add rax, OBJ_OFF_DATA
+mov [rax+0], r8
+
+mov rax, rbx
+add rax, OBJ_DATASZ_OFF
+mov rax, [rax+0]
+add r8, rax
+add r8, 7
+mov rcx, ALIGN8_MASK
+and r8, rcx
+mov rax, rbx
+add rax, OBJ_OFF_RELT
+mov [rax+0], r8
+
+mov rax, rbx
+add rax, OBJ_NRELT_OFF
+mov rax, [rax+0]
+mov rcx, RELAENT
+imul rax, rcx
+add r8, rax
+mov rax, rbx
+add rax, OBJ_OFF_RELD
+mov [rax+0], r8
+
+mov rax, rbx
+add rax, OBJ_NRELD_OFF
+mov rax, [rax+0]
+mov rcx, RELAENT
+imul rax, rcx
+add r8, rax
+mov rax, rbx
+add rax, OBJ_OFF_SYM
+mov [rax+0], r8
+
+mov rax, rbx
+add rax, OBJ_NSYM_OFF
+mov rax, [rax+0]
+mov rcx, SYMENT
+imul rax, rcx
+add r8, rax
+mov rax, rbx
+add rax, OBJ_OFF_STR
+mov [rax+0], r8
+
+mov rax, rbx
+add rax, OBJ_STRSZ_OFF
+mov rax, [rax+0]
+add r8, rax
+mov rax, rbx
+add rax, OBJ_OFF_SHSTR
+mov [rax+0], r8
+
+add r8, SHSTR_LEN
+add r8, 7
+mov rcx, ALIGN8_MASK
+and r8, rcx
+mov rax, rbx
+add rax, OBJ_OFF_SHDR
+mov [rax+0], r8
+ret
+
+; ===========================================================================
+; obj_shdrs -- the section header table. The region is a fresh mapping,
+; so every field that should be zero already is: only the nonzero ones
+; are written, and the NULL header at index 0 needs nothing at all.
+; ===========================================================================
+obj_shdrs:
+; --- 1: .text ---
+mov rdi, rbx
+add rdi, OBJ_SHDR_OFF
+add rdi, SHDR_ENT
+mov rax, 1                         ; sh_name -- see obj_shstr
+mov rcx, SHT_PROGBITS
+mov rdx, rbx
+add rdx, OBJ_OFF_TEXT
+mov rdx, [rdx+0]
+mov rsi, rbx
+add rsi, OBJ_TEXTSZ_OFF
+mov rsi, [rsi+0]
+call obj_put_shdr
+mov rax, SHF_ALLOC
+add rax, SHF_EXEC
+mov [rdi+8], rax
+mov rax, 16
+mov [rdi+48], rax
+
+; --- 2: .data ---
+mov rdi, rbx
+add rdi, OBJ_SHDR_OFF
+mov rax, SHDR_ENT
+shl rax, 1
+add rdi, rax
+mov rax, 7
+mov rcx, SHT_PROGBITS
+mov rdx, rbx
+add rdx, OBJ_OFF_DATA
+mov rdx, [rdx+0]
+mov rsi, rbx
+add rsi, OBJ_DATASZ_OFF
+mov rsi, [rsi+0]
+call obj_put_shdr
+mov rax, SHF_ALLOC
+add rax, SHF_WRITE
+mov [rdi+8], rax
+mov rax, 8
+mov [rdi+48], rax
+
+; --- 3: .bss. NOBITS occupies no file space, so its offset is only a
+; placeholder; it sits where .data ends. ---
+mov rdi, rbx
+add rdi, OBJ_SHDR_OFF
+mov rax, SHDR_ENT
+mov rcx, 3
+imul rax, rcx
+add rdi, rax
+mov rax, 13
+mov rcx, SHT_NOBITS
+mov rdx, rbx
+add rdx, OBJ_OFF_RELT
+mov rdx, [rdx+0]
+mov rsi, rbx
+add rsi, OBJ_BSSSZ_OFF
+mov rsi, [rsi+0]
+call obj_put_shdr
+mov rax, SHF_ALLOC
+add rax, SHF_WRITE
+mov [rdi+8], rax
+mov rax, 8
+mov [rdi+48], rax
+
+; --- 4: .symtab ---
+mov rdi, rbx
+add rdi, OBJ_SHDR_OFF
+mov rax, SHDR_ENT
+mov rcx, 4
+imul rax, rcx
+add rdi, rax
+mov rax, 18
+mov rcx, SHT_SYMTAB
+mov rdx, rbx
+add rdx, OBJ_OFF_SYM
+mov rdx, [rdx+0]
+mov rsi, rbx
+add rsi, OBJ_NSYM_OFF
+mov rsi, [rsi+0]
+mov rax, SYMENT
+imul rsi, rax
+mov rax, 18
+call obj_put_shdr
+push rdi
+mov rax, SEC_IDX_STRTAB
+add rdi, 40
+call store_dword                   ; sh_link
+pop rdi
+push rdi
+mov rax, rbx
+add rax, OBJ_NLOCAL_OFF
+mov rax, [rax+0]
+add rdi, 44
+call store_dword                   ; sh_info = first global
+pop rdi
+mov rax, 8
+mov [rdi+48], rax
+mov rax, SYMENT
+mov [rdi+56], rax
+
+; --- 5: .strtab ---
+mov rdi, rbx
+add rdi, OBJ_SHDR_OFF
+mov rax, SHDR_ENT
+mov rcx, 5
+imul rax, rcx
+add rdi, rax
+mov rax, 26
+mov rcx, SHT_STRTAB
+mov rdx, rbx
+add rdx, OBJ_OFF_STR
+mov rdx, [rdx+0]
+mov rsi, rbx
+add rsi, OBJ_STRSZ_OFF
+mov rsi, [rsi+0]
+call obj_put_shdr
+mov rax, 1
+mov [rdi+48], rax
+
+; --- 6: .rela.text ---
+mov rdi, rbx
+add rdi, OBJ_SHDR_OFF
+mov rax, SHDR_ENT
+mov rcx, 6
+imul rax, rcx
+add rdi, rax
+mov rax, 34
+mov rcx, SHT_RELA
+mov rdx, rbx
+add rdx, OBJ_OFF_RELT
+mov rdx, [rdx+0]
+mov rsi, rbx
+add rsi, OBJ_NRELT_OFF
+mov rsi, [rsi+0]
+mov rax, RELAENT
+imul rsi, rax
+mov rax, 34
+call obj_put_shdr
+mov rcx, SEC_IDX_TEXT
+call obj_rela_links
+
+; --- 7: .rela.data ---
+mov rdi, rbx
+add rdi, OBJ_SHDR_OFF
+mov rax, SHDR_ENT
+mov rcx, 7
+imul rax, rcx
+add rdi, rax
+mov rax, 45
+mov rcx, SHT_RELA
+mov rdx, rbx
+add rdx, OBJ_OFF_RELD
+mov rdx, [rdx+0]
+mov rsi, rbx
+add rsi, OBJ_NRELD_OFF
+mov rsi, [rsi+0]
+mov rax, RELAENT
+imul rsi, rax
+mov rax, 45
+call obj_put_shdr
+mov rcx, SEC_IDX_DATA
+call obj_rela_links
+
+; --- 8: .shstrtab ---
+mov rdi, rbx
+add rdi, OBJ_SHDR_OFF
+mov rax, SHDR_ENT
+mov rcx, 8
+imul rax, rcx
+add rdi, rax
+mov rax, 56
+mov rcx, SHT_STRTAB
+mov rdx, rbx
+add rdx, OBJ_OFF_SHSTR
+mov rdx, [rdx+0]
+mov rsi, SHSTR_LEN
+call obj_put_shdr
+mov rax, 1
+mov [rdi+48], rax
+ret
+
+; obj_rela_links -- rdi = &shdr of a .rela section, rcx = the section it
+; relocates. sh_link is always .symtab.
+obj_rela_links:
+push rdi
+push rcx
+mov rax, SEC_IDX_SYMTAB
+add rdi, 40
+call store_dword
+pop rax
+pop rdi
+push rdi
+add rdi, 44
+call store_dword                   ; sh_info = the relocated section
+pop rdi
+mov rax, 8
+mov [rdi+48], rax
+mov rax, RELAENT
+mov [rdi+56], rax
+ret
+
+; obj_put_shdr -- rdi = &shdr, rax = sh_name, rcx = sh_type,
+;   rdx = sh_offset, rsi = sh_size. The remaining fields are either zero
+;   already or set by the caller, which is why this takes five arguments
+;   and not eleven.
+obj_put_shdr:
+push rdi
+push rcx
+push rdx
+push rsi
+call store_dword                   ; sh_name
+pop rsi
+pop rdx
+pop rcx
+pop rdi
+push rdi
+push rdx
+push rsi
+mov rax, rcx
+add rdi, 4
+call store_dword                   ; sh_type
+pop rsi
+pop rdx
+pop rdi
+mov [rdi+24], rdx
+mov [rdi+32], rsi
+ret
+
+; ===========================================================================
+; obj_ehdr -- the ELF header, built in the first 64 bytes of the text
+; buffer. Those bytes are the executable's program-header area, which an
+; object does not use, so there is nothing to displace.
+; ===========================================================================
+obj_ehdr:
+mov rcx, 127
+movb [r14+0], rcx
+mov rcx, 69
+movb [r14+1], rcx
+mov rcx, 76
+movb [r14+2], rcx
+mov rcx, 70
+movb [r14+3], rcx
+mov rcx, 2                         ; ELFCLASS64
+movb [r14+4], rcx
+mov rcx, 1                         ; ELFDATA2LSB
+movb [r14+5], rcx
+movb [r14+6], rcx                  ; EV_CURRENT
+mov rcx, 0
+movb [r14+7], rcx
+mov [r14+8], rcx
+mov rcx, 1                         ; e_type = ET_REL
+movb [r14+16], rcx
+mov rcx, 0
+movb [r14+17], rcx
+mov rcx, 62                        ; e_machine = EM_X86_64
+movb [r14+18], rcx
+mov rcx, 0
+movb [r14+19], rcx
+mov rdi, r14
+add rdi, 20
+mov rax, 1                         ; e_version
+call store_dword
+mov rcx, 0
+mov [r14+24], rcx                  ; e_entry: an object has no entry point
+mov [r14+32], rcx                  ; e_phoff
+mov rax, rbx
+add rax, OBJ_OFF_SHDR
+mov rax, [rax+0]
+mov [r14+40], rax                  ; e_shoff
+mov rdi, r14
+add rdi, 48
+mov rax, 0
+call store_dword                   ; e_flags
+mov rcx, 64                        ; e_ehsize
+movb [r14+52], rcx
+mov rcx, 0
+movb [r14+53], rcx
+movb [r14+54], rcx                 ; e_phentsize
+movb [r14+55], rcx
+movb [r14+56], rcx                 ; e_phnum
+movb [r14+57], rcx
+mov rcx, SHDR_ENT
+movb [r14+58], rcx
+mov rcx, 0
+movb [r14+59], rcx
+mov rcx, OBJ_NSEC
+movb [r14+60], rcx
+mov rcx, 0
+movb [r14+61], rcx
+mov rcx, SEC_IDX_SHSTR
+movb [r14+62], rcx
+mov rcx, 0
+movb [r14+63], rcx
+ret
+
+; ===========================================================================
+; obj_write_file -- open the output and write each piece in file order.
+; There is no staging buffer: every piece already exists somewhere in the
+; arena, and the offsets computed above say where each one lands.
+; ===========================================================================
+obj_write_file:
+mov rax, rbx
+add rax, OUTPATH_OFF
+mov rdi, [rax+0]
+cmp rdi, 1
+je obj_out_is_stdout
+mov rsi, O_WRONLY_CREAT_TRUNC
+mov rdx, MODE_644                  ; an object is not executable
+mov rax, SYS_open
+syscall
+cmp rax, 0
+jl die_open
+mov rcx, rbx
+add rcx, OUTPUT_FD_OFF
+mov [rcx+0], rax
+obj_out_is_stdout:
+
+mov rsi, r14                       ; the ELF header
+mov rdx, 64
+call obj_put
+
+mov rsi, r14                       ; .text
+add rsi, HDR_LEN
+mov rdx, rbx
+add rdx, OBJ_TEXTSZ_OFF
+mov rdx, [rdx+0]
+call obj_put
+
+mov rsi, rbx                       ; .data
+add rsi, DATABUF_OFF
+mov rdx, rbx
+add rdx, OBJ_DATASZ_OFF
+mov rdx, [rdx+0]
+call obj_put
+
+; --- padding up to the first 8-byte-aligned structure ---
+mov rax, rbx
+add rax, OBJ_OFF_RELT
+mov rax, [rax+0]
+mov rcx, rbx
+add rcx, OBJ_OFF_DATA
+mov rcx, [rcx+0]
+mov rdx, rbx
+add rdx, OBJ_DATASZ_OFF
+mov rdx, [rdx+0]
+add rcx, rdx
+sub rax, rcx                       ; alignment gap, 0..7 bytes
+mov rdx, rax
+mov rsi, rbx
+add rsi, OBJ_ZERO_OFF
+call obj_put
+
+mov rsi, rbx                       ; .rela.text
+add rsi, OBJ_RELT_OFF
+mov rdx, rbx
+add rdx, OBJ_NRELT_OFF
+mov rdx, [rdx+0]
+mov rax, RELAENT
+imul rdx, rax
+call obj_put
+
+mov rsi, rbx                       ; .rela.data
+add rsi, OBJ_RELD_OFF
+mov rdx, rbx
+add rdx, OBJ_NRELD_OFF
+mov rdx, [rdx+0]
+mov rax, RELAENT
+imul rdx, rax
+call obj_put
+
+mov rsi, rbx                       ; .symtab
+add rsi, OBJ_SYM_OFF
+mov rdx, rbx
+add rdx, OBJ_NSYM_OFF
+mov rdx, [rdx+0]
+mov rax, SYMENT
+imul rdx, rax
+call obj_put
+
+mov rsi, rbx                       ; .strtab
+add rsi, OBJ_STR_OFF
+mov rdx, rbx
+add rdx, OBJ_STRSZ_OFF
+mov rdx, [rdx+0]
+call obj_put
+
+mov rsi, obj_shstr                 ; .shstrtab
+mov rdx, SHSTR_LEN
+call obj_put
+
+mov rax, rbx                       ; padding before the header table
+add rax, OBJ_OFF_SHDR
+mov rax, [rax+0]
+mov rcx, rbx
+add rcx, OBJ_OFF_SHSTR
+mov rcx, [rcx+0]
+add rcx, SHSTR_LEN
+sub rax, rcx
+mov rdx, rax
+mov rsi, rbx
+add rsi, OBJ_ZERO_OFF
+call obj_put
+
+mov rsi, rbx                       ; the section header table
+add rsi, OBJ_SHDR_OFF
+mov rdx, OBJ_NSEC
+mov rax, SHDR_ENT
+imul rdx, rax
+call obj_put
+
+mov rax, rbx
+add rax, INPUT_FD_OFF
+mov rax, [rax+0]
+cmp rax, 0
+je obj_close_in_skip
+mov rdi, rax
+mov rax, SYS_close
+syscall
+obj_close_in_skip:
+mov rax, rbx
+add rax, OUTPUT_FD_OFF
+mov rax, [rax+0]
+cmp rax, 1
+je obj_close_out_skip
+mov rdi, rax
+mov rax, SYS_close
+syscall
+obj_close_out_skip:
+ret
+
+; obj_put -- rsi = bytes, rdx = length. A zero length is a no-op rather
+; than a zero-byte write, which some file types treat as end-of-file.
+obj_put:
+cmp rdx, 0
+je obj_put_ret
+mov rdi, rbx
+add rdi, OUTPUT_FD_OFF
+mov rdi, [rdi+0]
+mov rax, SYS_write
+syscall
+cmp rax, 0
+jl die_write
+obj_put_ret:
+ret
 
 build_output:
 mov rax, rbx
@@ -1718,18 +2768,37 @@ mov [r9+24], rcx                    ; value (offset within its section)
 mov [r9+40], rdx                    ; section
 mov rdx, 1
 mov [r9+32], rdx                    ; status
-; Record the slot in this process's defined-label list. Serial runs never
-; read the list; a parallel worker walks it to tell the parent which
-; labels it defined, which is far cheaper than rescanning the hash table.
+mov rax, r9
+call deflist_append
+ret
+
+; ===========================================================================
+; deflist_append -- rax = symbol slot. Records it in this process's list
+; of symbols it declared.
+;
+; A parallel worker walks the list to tell the parent which labels it
+; defined, which is far cheaper than rescanning the hash table. Object
+; output walks the same list to build .symtab, which is why `extern`
+; appends here too: an undefined symbol still has to appear in the table
+; for a relocation to name it, and a relocation that names symbol 0
+; resolves to absolute zero without the linker objecting -- silently, and
+; the program segfaults on the first call.
+;
+; The list cannot overflow: it is 8 MiB of 8-byte entries against a
+; symbol table capped at SYM_POP_MAX.
+;   clob: rax, rcx, rdx, rsi
+; ===========================================================================
+deflist_append:
+mov rsi, rax
 mov rax, rbx
 add rax, DEFLIST_META_OFF
 mov rcx, [rax+0]
 mov rdx, rcx
 shl rdx, 3
-mov rsi, rbx
-add rsi, DEFLIST_OFF
-add rdx, rsi
-mov [rdx+0], r9
+mov rdi, rbx
+add rdi, DEFLIST_OFF
+add rdx, rdi
+mov [rdx+0], rsi
 add rcx, 1
 mov [rax+0], rcx
 ret
@@ -5157,6 +6226,56 @@ call expect_eol
 ret
 
 ; ===========================================================================
+; global NAME / extern NAME -- symbol visibility, for object output.
+;
+; Both take a name that may not exist yet, which is why they go through
+; find_or_create_symbol: `global main` before `main:` leaves a
+; placeholder that define_label fills in later, exactly as a forward
+; reference does. The binding lives in the 16 bytes the 64-byte symbol
+; slot already had spare, so nothing about the table's stride or its
+; probing changes.
+;
+; `global` on a flat executable is accepted and does nothing, the way
+; nasm treats it -- the binding simply has nowhere to be recorded.
+; `extern` is refused there instead of ignored: a flat binary has no
+; relocations, so a reference to an undefined name cannot be left for
+; anyone to resolve, and pretending otherwise would emit a call to
+; address zero.
+; ===========================================================================
+do_global:
+call skip_ws
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+call find_or_create_symbol
+mov rcx, SYMB_GLOBAL
+mov [rax+48], rcx
+call expect_eol
+ret
+
+do_extern:
+mov rax, rbx
+add rax, OUTFMT_OFF
+mov rax, [rax+0]
+cmp rax, OUTFMT_OBJECT
+jne die_extern_flat
+call skip_ws
+call scan_ident
+cmp rcx, 0
+je die_bad_operand
+call find_or_create_symbol
+mov rcx, [rax+32]
+cmp rcx, 0
+jne die_dup_label                  ; already defined here, or already extern
+mov rcx, SYM_EXTERN
+mov [rax+32], rcx
+mov rcx, SYMB_GLOBAL
+mov [rax+48], rcx
+call deflist_append                ; it has to be in .symtab for a
+call expect_eol                    ; relocation to be able to name it
+ret
+
+; ===========================================================================
 ; db "literal" (verbatim, no escapes) or db imm8/const (single raw byte)
 ; ===========================================================================
 do_db:
@@ -5455,7 +6574,7 @@ jmp die_unknown_mnem
 
 parse_stmt_bucket_d:
 cmp r9, 100                         ; 'd': db, dw, dd, dq
-jne parse_stmt_bucket_i
+jne parse_stmt_bucket_e
 cmp r8, PACK_DB
 je parse_stmt_call_db
 cmp r8, PACK_DW
@@ -5464,6 +6583,22 @@ cmp r8, PACK_DD
 je parse_stmt_call_dd
 cmp r8, PACK_DQ
 je parse_stmt_call_dq
+jmp die_unknown_mnem
+
+parse_stmt_bucket_e:
+cmp r9, 101                         ; 'e': extern
+jne parse_stmt_bucket_g
+mov rax, PACK_EXTERN                ; 6 bytes, past the imm32 a cmp can
+cmp r8, rax                         ; carry -- same reason as PACK_SYSCALL
+je parse_stmt_call_extern
+jmp die_unknown_mnem
+
+parse_stmt_bucket_g:
+cmp r9, 103                         ; 'g': global
+jne parse_stmt_bucket_i
+mov rax, PACK_GLOBAL
+cmp r8, rax
+je parse_stmt_call_global
 jmp die_unknown_mnem
 
 parse_stmt_bucket_i:
@@ -5570,6 +6705,12 @@ cmp r8, PACK_XOR
 je parse_stmt_call_xor
 jmp die_unknown_mnem
 
+parse_stmt_call_global:
+call do_global
+ret
+parse_stmt_call_extern:
+call do_extern
+ret
 parse_stmt_call_mov:
 call do_mov
 ret
@@ -5783,6 +6924,15 @@ jmp die
 die_unknown_mnem:
 mov rdi, msg_unknown
 jmp die_at_line
+die_rel_const:
+mov rdi, msg_relconst
+jmp die
+die_extern_flat:
+mov rdi, msg_externflat
+jmp die_at_line
+die_bad_format:
+mov rdi, msg_badformat
+jmp die
 die_bad_hex:
 mov rdi, msg_badhex
 jmp die_at_line
@@ -5978,6 +7128,30 @@ add r10, 1
 ret
 
 ; === read-only data =========================================================
+
+; .shstrtab for object output. Fixed content, so the sh_name of every
+; section is a constant offset into it rather than something to compute:
+; .text=1 .data=7 .bss=13 .symtab=18 .strtab=26 .rela.text=34
+; .rela.data=45 .shstrtab=56, and SHSTR_LEN=66 is the total.
+obj_shstr:
+db 0
+db ".text"
+db 0
+db ".data"
+db 0
+db ".bss"
+db 0
+db ".symtab"
+db 0
+db ".strtab"
+db 0
+db ".rela.text"
+db 0
+db ".rela.data"
+db 0
+db ".shstrtab"
+db 0
+
 msg_mmap:
 db "v1: mmap failed"
 db 10
@@ -6000,6 +7174,17 @@ db 10
 db 0
 msg_write:
 db "v1: write failed"
+db 10
+db 0
+msg_relconst:
+db "v1: relative reference to a constant cannot be relocated"
+db 10
+db 0
+msg_externflat:
+db "v1: extern requires -f elf64"
+db 0
+msg_badformat:
+db "v1: -f takes elf64 and nothing else"
 db 10
 db 0
 msg_badhex:
