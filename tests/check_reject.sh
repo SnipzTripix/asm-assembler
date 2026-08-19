@@ -63,6 +63,18 @@ reject "shift count over 63"     'shl rax, 100\n'
 reject "immediate over 64 bits"  'mov rax, 99999999999999999999999\n'
 reject "displacement over 32 bits" 'mov rax, [rbx+99999999999]\n'
 
+echo "--- hex literals ---"
+# 'Z'+1 was used where 'F'+1 belonged, so every letter A-Z took the
+# uppercase-digit branch: G-Z became digit values 16..35 and `0xZZ`
+# assembled silently as 595. Lowercase was never affected.
+reject "uppercase G in hex"      'mov rax, 0xZZ\nret\n'
+reject "uppercase G alone"       'mov rax, 0xG\nret\n'
+reject "hex with no digits"      'mov rax, 0x\nret\n'
+reject "hex no digits in db"     'db 0x\n'
+value  "uppercase hex digits"  255 'mov rdi, 0xFF\nmov rax, 60\nsyscall\n'
+value  "lowercase hex digits"  171 'mov rdi, 0xab\nmov rax, 60\nsyscall\n'
+value  "mixed-case hex digits"  47 'mov rdi, 0x2F\nmov rax, 60\nsyscall\n'
+
 echo "--- data directives must not truncate their operand ---"
 reject "db over 8 bits"          'db 300\n'
 reject "dw over 16 bits"         'dw 0x12345\n'

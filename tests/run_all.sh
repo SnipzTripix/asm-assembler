@@ -56,6 +56,9 @@ echo "=== %include ==="
 echo "=== review regressions ==="
 ./tests/check_review.sh "$V" || fail=1
 
+echo "=== a worker count never breaks a build ==="
+./tests/check_par_fallback.sh "$V" || fail=1
+
 echo "=== equ aliases resolve the same in both paths ==="
 ./tests/check_equ_par.sh "$V" || fail=1
 

@@ -239,22 +239,39 @@ CHUNK_SHIFT     equ 6                    ; log2(CHUNK_ENT) -- indexing uses this
 ; private, which is exactly why no locking is needed anywhere: workers
 ; never write to shared state except their own slot, and the parent only
 ; reads a slot after wait4 has confirmed that worker exited. ---
-SLOT_SIZE       equ 0x1000000            ; 16 MiB per worker
+SLOT_SIZE       equ 0x2000000            ; 32 MiB per worker
+SLOT_SHIFT      equ 25                   ; log2(SLOT_SIZE); the shared mapping
+                                         ; is jobs << SLOT_SHIFT bytes, so the
+                                         ; two cannot drift apart
 SLOT_TEXT_OFF   equ 0x1000               ; meta lives in the first 4 KiB
 SLOT_TEXT_CAP   equ 0x600000             ; 6 MiB
 SLOT_DATA_OFF   equ 0x601000
 SLOT_DATA_CAP   equ 0x400000             ; 4 MiB
 SLOT_SYM_OFF    equ 0xA01000
-SLOT_SYM_CAP    equ 0x200000             ; 2 MiB / 64 B = 32768 labels
-SLOT_FIX_OFF    equ 0xC01000
-SLOT_FIX_CAP    equ 0x300000             ; 3 MiB / 48 B = 65536 fixups
-SHARED_TOTAL    equ 0x10000000           ; MAX_JOBS * SLOT_SIZE = 256 MiB
+SLOT_SYM_CAP    equ 0x800000             ; 8 MiB / 64 B = 131072 labels
+SLOT_FIX_OFF    equ 0x1201000
+SLOT_FIX_CAP    equ 0x800000             ; 8 MiB / 48 B = 174762 fixups
+                                         ; The symbol capacity was 32768,
+                                         ; which is per CHUNK, so asking for
+                                         ; FEWER workers made each chunk
+                                         ; bigger and blew it: a 100k-label
+                                         ; file assembled at -j1 and -j4 but
+                                         ; not at -j2. These are lazily
+                                         ; mapped, so the only cost of the
+                                         ; larger numbers is address space.
 
 ; slot meta fields
 SM_TEXTSZ       equ 0
 SM_DATASZ       equ 8
 SM_NSYM         equ 16
 SM_NFIX         equ 24
+SM_NOFIT        equ 32                   ; 1 = this chunk did not fit its
+                                         ; slot. Not an error: the parent
+                                         ; throws every worker's output away
+                                         ; and assembles the file serially,
+                                         ; because asking for workers must
+                                         ; never turn a build that works
+                                         ; into one that does not.
 ; A worker that dies writes its own diagnostic to fd 2, which it shares
 ; with the parent, so the message reaches the user with a correct line
 ; number and no marshalling is needed. Slots therefore carry no error
@@ -341,6 +358,10 @@ CH_COLON        equ 58
 CH_SEMI         equ 59
 CH_A            equ 65
 CH_ZPLUS1       equ 91
+CH_FPLUS1       equ 71                 ; 'F'+1 -- the end of the UPPERCASE
+                                       ; hex digits. CH_ZPLUS1 above is 'Z'+1
+                                       ; and was used here by mistake, which
+                                       ; made G-Z parse as digits 16..35
 CH_LBRACKET     equ 91
 CH_RBRACKET     equ 93
 CH_US           equ 95
@@ -532,7 +553,11 @@ cmp r11, 1
 je start_no_shared
 push r11
 mov rdi, 0
-mov rsi, SHARED_TOTAL
+mov rsi, r11                       ; only the slots that will actually be
+shl rsi, SLOT_SHIFT                ; used, not MAX_JOBS of them: -j2 maps
+                                   ; two slots, not sixteen. Lazy pages made
+                                   ; the difference invisible, which is not
+                                   ; the same as it being right.
 mov rdx, PROT_RW
 mov r10, MAP_SHARED_ANON
 mov r8, NEG_ONE
@@ -600,6 +625,13 @@ mov rcx, 1
 mov [rax+0], rcx
 call expand_includes               ; splice included files in before any
                                     ; parsing, chunking or line counting
+serial_init:                        ; re-entered when parallel assembly
+                                    ; gives up and hands the file back (see
+                                    ; par_assemble); everything the prescan
+                                    ; moved -- input cursor, line number,
+                                    ; section, both section cursors -- is
+                                    ; re-established right here, so the
+                                    ; fallback needs no separate reset path
 mov r13, rbx
 mov r15, r14
 add r15, HDR_LEN
@@ -651,7 +683,14 @@ mov rax, [rax+0]
 cmp rax, 1
 je stmt_loop
 call par_assemble
-jmp build_output
+cmp rax, 0
+je build_output
+mov rax, rbx                        ; a chunk did not fit its slot. Force
+add rax, JOBS_OFF                   ; one worker and go back through the
+mov rcx, 1                          ; same init the serial path always
+mov [rax+0], rcx                    ; uses; setting the job count first is
+jmp serial_init                     ; what stops it forking again
+
 
 stmt_loop:
 cmp r13, r12
@@ -1328,25 +1367,32 @@ movb rcx, [r13+1]
 cmp rcx, CH_x
 jne parse_imm_decimal
 add r13, 2
+push r13                        ; where the digits have to start: "0x" on
+                                ; its own used to fall straight out of the
+                                ; loop with rax still 0 and assemble as the
+                                ; literal 0, so at least one digit is now a
+                                ; requirement rather than an assumption
 parse_imm_hex_loop:
 cmp r13, r12
-jae parse_imm_done
+jae parse_imm_hex_end
 movb rcx, [r13+0]
 cmp rcx, CH_0
-jl parse_imm_done
+jl parse_imm_hex_end
 cmp rcx, CH_9PLUS1
 jae parse_imm_hex_alpha
 sub rcx, CH_0
 jmp parse_imm_hex_acc
 parse_imm_hex_alpha:
 cmp rcx, CH_A
-jl parse_imm_done
+jl parse_imm_hex_end
 cmp rcx, CH_fPLUS1
-jae parse_imm_done
-cmp rcx, CH_ZPLUS1
-jl parse_imm_hex_upper
+jae parse_imm_hex_end
+cmp rcx, CH_FPLUS1              ; 'F'+1, not 'Z'+1. With 'Z'+1 here every
+jl parse_imm_hex_upper          ; letter A-Z took the uppercase branch, so
+                                ; G-Z became digits 16..35 and 0xZZ
+                                ; assembled quietly as 595
 cmp rcx, CH_a
-jl parse_imm_done
+jl parse_imm_hex_end
 sub rcx, CH_a
 add rcx, 10
 jmp parse_imm_hex_acc
@@ -1362,6 +1408,11 @@ shl rax, 4
 add rax, rcx
 add r13, 1
 jmp parse_imm_hex_loop
+parse_imm_hex_end:
+pop rdx
+cmp rdx, r13
+je die_bad_hex
+jmp parse_imm_done
 parse_imm_decimal:
 mov rax, 0
 parse_imm_dec_loop:
@@ -2376,11 +2427,23 @@ ret
 ; constants are -- so a chunk cannot be assembled until they are known at
 ; its start.
 ; ===========================================================================
+;   out: rax = 0 if the file is assembled and merged, 1 if some chunk did
+;   not fit its slot and the caller must redo the whole file serially.
+;   Nothing the parent owns has been written to at that point -- workers
+;   only ever write their own shared slot, and the merge is what would
+;   have touched the parent's buffers -- so falling back is just a matter
+;   of not calling it.
 par_assemble:
 call par_prescan
 call par_spawn
+cmp rax, 0
+jne par_assemble_nofit
 call par_install_consts             ; the parent needs them too, in case a
 call par_merge                      ; deferred fixup names a constant
+mov rax, 0
+ret
+par_assemble_nofit:
+mov rax, 1
 ret
 
 ; ===========================================================================
@@ -2921,6 +2984,36 @@ jne par_worker_failed
 add r9, 1
 jmp par_spawn_wait_loop
 par_spawn_done:
+; Every worker is reaped. Did any of them find its chunk too big for its
+; slot? That is decided per chunk, so it can happen at one worker count
+; and not another -- the answer has to be read from the slots, not
+; predicted.
+;   out: rax = 1 if the run must be redone serially, 0 if the merge can
+;   proceed
+mov rax, rbx
+add rax, JOBS_OFF
+mov r8, [rax+0]
+mov r9, 0
+par_spawn_nofit_loop:
+cmp r9, r8
+jae par_spawn_all_fit
+mov rax, r9
+shl rax, SLOT_SHIFT
+mov rcx, rbx
+add rcx, SHARED_OFF
+mov rcx, [rcx+0]
+add rax, rcx
+add rax, SM_NOFIT
+mov rax, [rax+0]
+cmp rax, 0
+jne par_spawn_nofit
+add r9, 1
+jmp par_spawn_nofit_loop
+par_spawn_nofit:
+mov rax, 1
+ret
+par_spawn_all_fit:
+mov rax, 0
 ret
 
 par_worker_failed:
@@ -3225,10 +3318,20 @@ mov rdi, 0
 mov rax, SYS_exit
 syscall
 
+; This chunk produced more than its slot can carry. That is not the
+; user's mistake and it is not fatal: it depends on how the file happened
+; to divide, which is why the old "retry with fewer jobs" advice was
+; exactly backwards -- fewer workers means bigger chunks. The worker
+; records the fact, exits successfully so the parent does not treat it as
+; a crash, and the parent discards every slot and assembles serially.
+; Every one of the four checks above reaches here with the slot base at
+; [rsp+0].
 par_we_toobig:
-mov rdi, msg_chunk_too_big
-call write_cstr_fd2
-mov rdi, 1
+mov rax, [rsp+0]
+add rax, SM_NOFIT
+mov rcx, 1
+mov [rax+0], rcx
+mov rdi, 0
 mov rax, SYS_exit
 syscall
 
@@ -5631,6 +5734,9 @@ jmp die
 die_unknown_mnem:
 mov rdi, msg_unknown
 jmp die_at_line
+die_bad_hex:
+mov rdi, msg_badhex
+jmp die_at_line
 die_bad_operand:
 mov rdi, msg_operand
 jmp die_at_line
@@ -5847,6 +5953,9 @@ msg_write:
 db "v1: write failed"
 db 10
 db 0
+msg_badhex:
+db "v1: hex literal has no digits"
+db 0
 msg_unknown:
 db "v1: unknown mnemonic"
 db 0
@@ -5892,10 +6001,6 @@ db 10
 db 0
 msg_includeloop:
 db "v1: too many %include expansions (a file including itself?)"
-db 10
-db 0
-msg_chunk_too_big:
-db "v1: parallel chunk exceeded its slot; retry with fewer jobs"
 db 10
 db 0
 msg_disprange:
