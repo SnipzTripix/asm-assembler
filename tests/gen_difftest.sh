@@ -14,9 +14,14 @@
 # named here rather than silently omitted:
 #
 #   * jumps: we always emit rel32, as the single-pass design requires.
-#   * disp8: we always emit disp32 for the same reason (the length must
-#     be final at emit time). This is the only remaining systematic
-#     difference and it is checked for separately, below.
+#
+# Displacements used to be on that list. They are not any more: a
+# displacement is a constant known at emit time, so picking disp0/disp8
+# moves nothing, and the boundary block below tests exactly that choice
+# against the reference -- 0, +-127, +-128, and the first value that
+# must widen to disp32, across every base, with and without an index.
+# Those are the cases where mod bits and the rbp/r13 and rsp/r12 escapes
+# interact, which is where an encoder gets it wrong.
 set -u
 cd "$(dirname "$0")/.."
 V=${1:-./v1}
@@ -78,6 +83,34 @@ for b in $REGS; do
     for x in $IDXREGS; do
         for sc in 1 2 4 8; do
             emit "mov rax, [$b+$x*$sc+512]" "mov rax, [$b+$x*$sc+512]"
+        done
+    done
+done
+
+# --- displacement boundaries: the disp0 / disp8 / disp32 decision ---
+# rbp and r13 are the interesting bases: mod=00 with rm=101 means
+# RIP-relative, and in the SIB form it means "no base", so a zero offset
+# on those two must still be encoded as a disp8 of zero. rsp and r12
+# force a SIB byte regardless. GNU as makes the same choices, so any
+# disagreement here is ours.
+# A negative offset is written [base-N], never [base+-N]: the dialect
+# takes one sign, and the reference accepting both is not a reason to
+# generate a form v1 is right to reject.
+signed() { case $1 in -*) printf '%s' "$1" ;; *) printf '+%s' "$1" ;; esac; }
+
+for b in $REGS; do
+    for d in 0 1 127 128 -1 -128 -129 255 -32768; do
+        o=$(signed "$d")
+        emit "mov rcx, [$b$o]" "mov rcx, [$b$o]"
+        emit "mov [$b$o], rcx" "mov [$b$o], rcx"
+        emit "lea rdx, [$b$o]" "lea rdx, [$b$o]"
+    done
+done
+for b in $REGS; do
+    for x in rax rbp r12 r13; do
+        for d in 0 127 128 -128 -129; do
+            o=$(signed "$d")
+            emit "mov rax, [$b+$x*4$o]" "mov rax, [$b+$x*4$o]"
         done
     done
 done

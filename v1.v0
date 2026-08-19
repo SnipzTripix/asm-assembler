@@ -3828,9 +3828,10 @@ add r15, 3
 ret
 
 ; ===========================================================================
-; emit_mem -- REX.W(+R+B) + opcode + ModRM(mod=10)[+SIB] + disp32
+; emit_mem -- REX.W(+R+B) + opcode + ModRM[+SIB][+disp8/disp32]
 ;   in: r10 = opcode, rax = reg field, rdx = base reg, r9 = signed disp
-;   out: r15 += 7 (no SIB) or 8 (base is rsp/r12)
+;   out: r15 advances by the encoded length -- +1 for a SIB byte (base
+;   rsp/r12 or any index), and 0, 1 or 4 for the displacement
 ; ===========================================================================
 emit_mem:
 mov rcx, 0x48                      ; REX.W
@@ -3869,7 +3870,7 @@ emit_rex_x_done:
 ret
 
 ; ===========================================================================
-; emit_modrm_sib -- ModRM(mod=10) [+SIB] + disp32, written through r15.
+; emit_modrm_sib -- ModRM [+SIB] [+disp8/disp32], written through r15.
 ;   in: rax = reg field, rdx = base reg, r9 = disp32, plus the index and
 ;       scale parse_mem stored.
 ; A SIB byte is required whenever there is an index, and also when the
@@ -3877,10 +3878,43 @@ ret
 ; "SIB follows" rather than a plain register.
 ; ===========================================================================
 emit_modrm_sib:
+; --- pick the shortest displacement form that encodes this value ---
+; This is a purely local decision and that is the whole point: the
+; displacement is a constant, known in full at the moment the
+; instruction is emitted, so choosing a shorter encoding cannot move any
+; address that has already been emitted or any address still to come.
+; That is exactly what rel8 cannot promise (see the header comment) and
+; why one belongs here while the other needs a relaxation pass.
+mov r10, 0x80                      ; mod = 10, disp32 -- the fallback
+mov r11, 4
+mov rcx, rdx
+and rcx, 7
+cmp rcx, 5                         ; base rbp/r13: mod=00 with rm=101 means
+je emit_modrm_sib_try8             ; RIP-relative, and in the SIB form it
+                                   ; means "no base at all", so this base
+                                   ; always carries a displacement -- a
+                                   ; disp8 of zero when the offset is zero
+cmp r9, 0
+jne emit_modrm_sib_try8
+mov r10, 0                         ; mod = 00, no displacement bytes at all
+mov r11, 0
+jmp emit_modrm_sib_have
+emit_modrm_sib_try8:
+mov rcx, r9                        ; fits in a sign-extended byte? same
+shr rcx, 7                         ; test shape as check_imm32, one bit
+cmp rcx, 0                         ; further down
+je emit_modrm_sib_mod1
+mov rsi, 0x1FFFFFFFFFFFFFF         ; 2^57-1: sign bit and everything above
+cmp rcx, rsi
+jne emit_modrm_sib_have
+emit_modrm_sib_mod1:
+mov r10, 0x40                      ; mod = 01, disp8
+mov r11, 1
+emit_modrm_sib_have:
 mov rsi, rax
 and rsi, 7
 shl rsi, 3
-add rsi, 0x80                      ; mod = 10 (disp32)
+add rsi, r10
 mov rdi, rbx
 add rdi, MEM_INDEX_OFF
 mov rdi, [rdi+0]
@@ -3922,17 +3956,27 @@ movb [r15+0], rcx
 add r15, 1
 
 emit_modrm_sib_disp:
+cmp r11, 0
+je emit_modrm_sib_ret
+cmp r11, 1
+je emit_modrm_sib_disp8
 mov rdi, r15
 mov rax, r9
 call store_dword
 add r15, 4
+ret
+emit_modrm_sib_disp8:
+movb [r15+0], r9
+add r15, 1
+emit_modrm_sib_ret:
 ret
 
 ; ===========================================================================
 ; emit_movb_load -- REX.W(+R+B) + 0F B6 /r + ModRM[+SIB] + disp32
 ; (MOVZX r64, r/m8)
 ;   in: rax = dst reg, rdx = base reg, r9 = signed disp
-;   out: r15 += 8 (no SIB) or 9 (base is rsp/r12)
+;   out: r15 advances by the encoded length -- +1 for a SIB byte (base
+;   rsp/r12 or any index), and 0, 1 or 4 for the displacement
 ; ===========================================================================
 emit_movb_load:
 mov rcx, 0x48                      ; REX.W: destination is the full 64-bit reg
@@ -3953,7 +3997,8 @@ ret
 ; (MOV r/m8, r8 -- REX forced even when otherwise unneeded, so reg=4..7
 ; means SPL/BPL/SIL/DIL and never AH/CH/DH/BH)
 ;   in: rax = src reg, rdx = base reg, r9 = signed disp
-;   out: r15 += 7 (no SIB) or 8 (base is rsp/r12)
+;   out: r15 advances by the encoded length -- +1 for a SIB byte (base
+;   rsp/r12 or any index), and 0, 1 or 4 for the displacement
 ; ===========================================================================
 emit_movb_store:
 ; Unlike the 16/32-bit stores, this one sometimes needs a REX prefix that
@@ -3978,7 +4023,8 @@ ret
 ; 0xB6). REX.W is mandatory here regardless of register choice, same
 ; reasoning as movb: the destination is always the full 64-bit register.
 ;   in: rax = dst reg, rdx = base reg, r9 = signed disp
-;   out: r15 += 8 (no SIB) or 9 (base is rsp/r12)
+;   out: r15 advances by the encoded length -- +1 for a SIB byte (base
+;   rsp/r12 or any index), and 0, 1 or 4 for the displacement
 ; ===========================================================================
 emit_movw_load:
 mov rcx, 0x48                      ; REX.W: destination is the full 64-bit reg
@@ -4001,7 +4047,8 @@ ret
 ; (no AH/CH/DH/BH-style ambiguity the way movb's store has), but it's
 ; forced anyway for the same fixed-byte-layout simplicity as movb/movd.
 ;   in: rax = src reg, rdx = base reg, r9 = signed disp
-;   out: r15 += 8 (no SIB) or 9 (base is rsp/r12)
+;   out: r15 advances by the encoded length -- +1 for a SIB byte (base
+;   rsp/r12 or any index), and 0, 1 or 4 for the displacement
 ; ===========================================================================
 emit_movw_store:
 mov rcx, 0x66                      ; operand-size override, then the same
@@ -4019,7 +4066,8 @@ ret
 ; 64-bit register, so this already has movb/movw's "load and zero-
 ; extend" behavior for free). REX carries only R/B here, never W.
 ;   in: rax = dst reg, rdx = base reg, r9 = signed disp
-;   out: r15 += 7 (no SIB) or 8 (base is rsp/r12)
+;   out: r15 advances by the encoded length -- +1 for a SIB byte (base
+;   rsp/r12 or any index), and 0, 1 or 4 for the displacement
 ; ===========================================================================
 emit_movd_load:
 mov r10, 0x8B
@@ -4030,7 +4078,7 @@ ret
 ; ===========================================================================
 ; emit_rex32_mem -- shared body for the 32-bit memory forms (and, with a
 ; 0x66 already emitted, the 16-bit stores): optional REX, one opcode
-; byte, ModRM(mod=10)[+SIB], disp32.
+; byte, ModRM[+SIB], then disp8 or disp32 or neither.
 ;   in: r10 = opcode, rax = reg field, rdx = base reg, r9 = disp32,
 ;       r11 = 1 to emit REX even when it carries no bits (movb only)
 ;
@@ -4061,7 +4109,8 @@ ret
 ; emit_movd_store -- REX(always present, W=0)+89 /r+ModRM[+SIB]+disp32
 ; (MOV r/m32, r32). Same shape as emit_movd_load, opcode 0x89 not 0x8B.
 ;   in: rax = src reg, rdx = base reg, r9 = signed disp
-;   out: r15 += 7 (no SIB) or 8 (base is rsp/r12)
+;   out: r15 advances by the encoded length -- +1 for a SIB byte (base
+;   rsp/r12 or any index), and 0, 1 or 4 for the displacement
 ; ===========================================================================
 emit_movd_store:
 mov r10, 0x89

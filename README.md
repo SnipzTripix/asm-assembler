@@ -97,6 +97,16 @@ single-pass design trades away, and it's why forward references need no
 second parse. It belongs behind an optimisation flag, not in the default
 path.
 
+Memory displacements are the opposite case, and used to be lumped in
+with `rel8` by mistake. A displacement is a *constant*, fully known at
+the moment the instruction is emitted, so choosing the shortest form
+moves nothing and needs no second pass. `[rbx]` is three bytes, not
+seven; `[rbx+8]` uses `disp8`; `rbp`/`r13` bases still carry an explicit
+zero because `mod=00` means something else for them. Every one of those
+choices is checked against GNU `as` across all 16 bases, four index
+registers and the values `0, ±1, ±127, ±128, ±129, 255, -32768` — the
+boundaries where the `mod` bits and the `rbp`/`rsp` escapes interact.
+
 ## Parallel assembly
 
 `v1` can assemble one file across multiple cores. Pass a worker count as
@@ -225,7 +235,7 @@ were found in the first place; `tests/check_reject.sh` is the asserting
 half of the same idea, and lists every input the assembler must refuse.
 
 That distinction turned out to matter. The suite was thorough about what
-the assembler *emits* — a fixed point, a 3504-instruction cross product
+the assembler *emits* — a fixed point, a 4256-instruction cross product
 against GNU `as` — and had nothing at all about what it should *refuse*,
 which is precisely the shape of the bugs it kept missing: input that
 assembles cleanly into the wrong program. Three other scripts were
@@ -276,7 +286,8 @@ two forms: a hand-written file covering every instruction form, and
 `tests/gen_difftest.sh`, which generates the full cross product — every
 ALU op across all 16×16 register pairs, every memory form across all
 bases, indices and scales, every unary form across all 16 registers,
-3504 instructions in total — and requires all 17250 bytes to match.
+4256 instructions in total, including the displacement boundary cases
+— and requires all 21494 bytes to match.
 Generating it rather than hand-writing it is what turns "no known
 encoding bugs" into "no encoding bugs in the tested space", and it is
 what makes changing the encoder safe.
