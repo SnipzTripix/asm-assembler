@@ -42,7 +42,9 @@
 ;   add sub and or xor cmp test   reg,reg and reg,imm; immediates may be
 ;            negative and are range-checked, never truncated
 ;   shl shr  imm8 or constant, unsigned
-;   push pop, jmp je jne jl jae, call (label or register), ret, syscall
+;   push pop, ret, syscall, call (label or register), jmp, and Jcc in
+;            all sixteen conditions: jo jno jb jae je jne jbe ja js jns
+;            jp jnp jl jge jle jg (canonical names only, no jz/jc aliases)
 ;   db       string with \n \t \r \0 \\ \" escapes, or a single byte
 ;   dw dd dq 2/4/8-byte values; dq also takes a label, which is what
 ;            makes a jump table expressible
@@ -89,10 +91,7 @@
 ; NOT implemented, i.e. what "grow the dialect further" still means here:
 ; arithmetic at widths other than 64-bit (movb/movw/movd cover memory
 ; access, but add/sub/cmp and friends are always full-width);
-; RIP-relative addressing; the remaining jcc conditions (jg/jle/jb/ja/
-; jbe/jge -- reachable by swapping operands or shifting a threshold by
-; one, which is what this file does throughout); and short (rel8) jump
-; encoding.
+; RIP-relative addressing; and short (rel8) jump encoding.
 ;
 ; rel8 is a deliberate omission rather than a missing feature. Choosing
 ; it requires knowing whether the target is within 127 bytes, which is
@@ -491,6 +490,18 @@ PACK_JE         equ 0x656A
 PACK_JNE        equ 0x656E6A
 PACK_JL         equ 0x6C6A
 PACK_JAE        equ 0x65616A
+PACK_JO         equ 0x6F6A
+PACK_JNO        equ 0x6F6E6A
+PACK_JB         equ 0x626A
+PACK_JBE        equ 0x65626A
+PACK_JA         equ 0x616A
+PACK_JS         equ 0x736A
+PACK_JNS        equ 0x736E6A
+PACK_JP         equ 0x706A
+PACK_JNP        equ 0x706E6A
+PACK_JGE        equ 0x65676A
+PACK_JLE        equ 0x656C6A
+PACK_JG         equ 0x676A
 PACK_CALL       equ 0x6C6C6163
 PACK_PUSH       equ 0x68737570
 PACK_POP        equ 0x706F70
@@ -2355,8 +2366,8 @@ mov r11, r13                       ; failure must leave r13 where it was:
 call scan_ident
 cmp rcx, 2                         ; every register name is 2 or 3 bytes,
 jl parse_reg_no                    ; so anything else is decided before a
-cmp rcx, 4                         ; single comparison happens (jae, not
-jae parse_reg_no                   ; ja: this dialect has no ja)
+cmp rcx, 3                         ; single comparison happens. This read
+ja parse_reg_no                    ; `cmp rcx, 4 / jae` until `ja` existed
 cmp rcx, 2
 je parse_reg_len2
 
@@ -6327,49 +6338,82 @@ do_call_tail:
 call expect_eol
 ret
 
-do_je:
+; ===========================================================================
+; Jcc rel32 -- 0F 8x + rel32 (SDM Vol2, Jcc rel32off). Every condition the
+; architecture defines, not the five that happened to be needed first.
+;
+; The missing ones were not a neutral gap. They showed up throughout this
+; file as thresholds shifted by one to spell a condition that existed in
+; terms of one that did not -- `cmp rcx, 4 / jae` where `cmp rcx, 3 / ja`
+; was meant -- which costs every later reader a moment of arithmetic to
+; check a comparison that should have read directly. Each of these is one
+; table entry and one opcode byte.
+;
+; Only the canonical name of each condition is accepted. jz/jnz/jc/jnc
+; and the other aliases are deliberately absent: two spellings of one
+; encoding is a thing to remember, and this dialect is small on purpose.
+;   in: rax = the second opcode byte
+; ===========================================================================
+do_jcc:
+push rax
 call skip_ws
 mov rax, 15
 movb [r15+0], rax
-mov rax, 0x84
+pop rax
 movb [r15+1], rax
 add r15, 2
 call emit_rel32_ref
 call expect_eol
 ret
 
-do_jne:
-call skip_ws
-mov rax, 15
-movb [r15+0], rax
-mov rax, 0x85
-movb [r15+1], rax
-add r15, 2
-call emit_rel32_ref
-call expect_eol
-ret
-
-do_jl:
-call skip_ws
-mov rax, 15
-movb [r15+0], rax
-mov rax, 0x8C
-movb [r15+1], rax
-add r15, 2
-call emit_rel32_ref
-call expect_eol
-ret
-
+do_jo:
+mov rax, 0x80
+jmp do_jcc
+do_jno:
+mov rax, 0x81
+jmp do_jcc
+do_jb:
+mov rax, 0x82
+jmp do_jcc
 do_jae:
-call skip_ws
-mov rax, 15
-movb [r15+0], rax
 mov rax, 0x83
-movb [r15+1], rax
-add r15, 2
-call emit_rel32_ref
-call expect_eol
-ret
+jmp do_jcc
+do_je:
+mov rax, 0x84
+jmp do_jcc
+do_jne:
+mov rax, 0x85
+jmp do_jcc
+do_jbe:
+mov rax, 0x86
+jmp do_jcc
+do_ja:
+mov rax, 0x87
+jmp do_jcc
+do_js:
+mov rax, 0x88
+jmp do_jcc
+do_jns:
+mov rax, 0x89
+jmp do_jcc
+do_jp:
+mov rax, 0x8A
+jmp do_jcc
+do_jnp:
+mov rax, 0x8B
+jmp do_jcc
+do_jl:
+mov rax, 0x8C
+jmp do_jcc
+do_jge:
+mov rax, 0x8D
+jmp do_jcc
+do_jle:
+mov rax, 0x8E
+jmp do_jcc
+do_jg:
+mov rax, 0x8F
+jmp do_jcc
 
 ; ===========================================================================
 ; syscall (0F 05) / ret (C3)
@@ -6786,6 +6830,30 @@ cmp r8, PACK_JL
 je parse_stmt_call_jl
 cmp r8, PACK_JAE
 je parse_stmt_call_jae
+cmp r8, PACK_JG
+je parse_stmt_call_jg
+cmp r8, PACK_JGE
+je parse_stmt_call_jge
+cmp r8, PACK_JLE
+je parse_stmt_call_jle
+cmp r8, PACK_JB
+je parse_stmt_call_jb
+cmp r8, PACK_JBE
+je parse_stmt_call_jbe
+cmp r8, PACK_JA
+je parse_stmt_call_ja
+cmp r8, PACK_JS
+je parse_stmt_call_js
+cmp r8, PACK_JNS
+je parse_stmt_call_jns
+cmp r8, PACK_JO
+je parse_stmt_call_jo
+cmp r8, PACK_JNO
+je parse_stmt_call_jno
+cmp r8, PACK_JP
+je parse_stmt_call_jp
+cmp r8, PACK_JNP
+je parse_stmt_call_jnp
 jmp die_unknown_mnem
 
 parse_stmt_bucket_l:
@@ -6870,6 +6938,42 @@ cmp r8, PACK_XOR
 je parse_stmt_call_xor
 jmp die_unknown_mnem
 
+parse_stmt_call_jg:
+call do_jg
+ret
+parse_stmt_call_jge:
+call do_jge
+ret
+parse_stmt_call_jle:
+call do_jle
+ret
+parse_stmt_call_jb:
+call do_jb
+ret
+parse_stmt_call_jbe:
+call do_jbe
+ret
+parse_stmt_call_ja:
+call do_ja
+ret
+parse_stmt_call_js:
+call do_js
+ret
+parse_stmt_call_jns:
+call do_jns
+ret
+parse_stmt_call_jo:
+call do_jo
+ret
+parse_stmt_call_jno:
+call do_jno
+ret
+parse_stmt_call_jp:
+call do_jp
+ret
+parse_stmt_call_jnp:
+call do_jnp
+ret
 parse_stmt_call_global:
 call do_global
 ret

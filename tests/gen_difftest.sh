@@ -95,6 +95,21 @@ for d in $REGS; do
     emit "mov $d, -2147483649"  "movabs $d, -2147483649"
 done
 
+# --- Jcc rel32, every condition ---
+# Jumps were exempt from this test because we always emit rel32 while the
+# reference shortens to rel8 whenever it can. That exemption hid the
+# opcode byte, which is the part worth checking. Putting each target
+# beyond rel8 range removes the reference's choice: 132 bytes of padding
+# after each jump means both assemblers must use rel32, and then the
+# bytes have to agree.
+n=0
+for c in o no b ae e ne be a s ns p np l ge le g; do
+    n=$((n+1))
+    emit "j$c Lj$n" "j$c Lj$n"
+    for _ in $(seq 132); do emit "db 0x90" ".byte 0x90"; done
+    emit "Lj$n:" "Lj$n:"
+done
+
 # --- unary forms ---
 for d in $REGS; do
     emit "neg $d"    "neg $d"

@@ -71,8 +71,9 @@ the dialect grows, so it's the source of truth, not this file. Briefly:
   label addresses), `lea`, `imul`, `neg`
 - `add sub and or xor cmp test` (reg,reg and reg,imm; immediates may be
   negative and are range-checked), `shl shr`
-- `push pop`, `jmp je jne jl jae`, `call` (label *or* register), `ret`,
-  `syscall`
+- `push pop`, `call` (label *or* register), `ret`, `syscall`, `jmp`, and
+  `Jcc` in all sixteen conditions (`jo jno jb jae je jne jbe ja js jns jp
+  jnp jl jge jle jg` — canonical names only, no `jz`/`jc` aliases)
 - `db` with `\n \t \r \0 \\ \"` escapes, `dw`/`dd`/`dq` — and `dq label`,
   which together with `call reg` makes a function-pointer dispatch table
   expressible
@@ -88,8 +89,7 @@ the dialect grows, so it's the source of truth, not this file. Briefly:
 
 Not yet implemented: arithmetic at widths other than 64-bit (memory
 access has `movb`/`movw`/`movd`; the ALU ops are always full-width),
-RIP-relative addressing, the remaining `jcc` conditions, and short
-(`rel8`) jumps.
+RIP-relative addressing, and short (`rel8`) jumps.
 
 `rel8` is a deliberate omission. Picking it requires knowing whether the
 target is within 127 bytes, which isn't known when the instruction is
@@ -280,7 +280,7 @@ were found in the first place; `tests/check_reject.sh` is the asserting
 half of the same idea, and lists every input the assembler must refuse.
 
 That distinction turned out to matter. The suite was thorough about what
-the assembler *emits* — a fixed point, a 4256-instruction cross product
+the assembler *emits* — a fixed point, a 7220-instruction cross product
 against GNU `as` — and had nothing at all about what it should *refuse*,
 which is precisely the shape of the bugs it kept missing: input that
 assembles cleanly into the wrong program. Three other scripts were
@@ -331,8 +331,9 @@ two forms: a hand-written file covering every instruction form, and
 `tests/gen_difftest.sh`, which generates the full cross product — every
 ALU op across all 16×16 register pairs, every memory form across all
 bases, indices and scales, every unary form across all 16 registers,
-4256 instructions in total, including the displacement boundary cases
-— and requires all 21494 bytes to match.
+7220 instructions in total, including displacement boundaries, every
+immediate encoding and all sixteen jump conditions
+— and requires all 27954 bytes to match.
 Generating it rather than hand-writing it is what turns "no known
 encoding bugs" into "no encoding bugs in the tested space", and it is
 what makes changing the encoder safe.
