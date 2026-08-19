@@ -54,9 +54,15 @@ errors "imm64 overflow"       'mov rax, 99999999999999999999999\nret\n'
 # check is the same bug wearing the opposite sign. (add/sub go through
 # the general 81 /digit form -- this dialect has no accumulator-specific
 # short opcode, which is a size choice, not a correctness one.)
+# 0xFFFFFFFFFFFFFFFF is -1, so the sign-extended imm32 form sets exactly
+# the same bits in three fewer bytes. The value still has to survive
+# parsing at full width, which is what this is really testing.
 emits  "unsigned imm64 max" \
-       "48 b8 ff ff ff ff ff ff ff ff c3" \
+       "48 c7 c0 ff ff ff ff c3" \
        'mov rax, 18446744073709551615\nret\n'
+emits  "imm64 that needs all 64 bits" \
+       "48 b8 f0 de bc 9a 78 56 34 12 c3" \
+       'mov rax, 0x123456789ABCDEF0\nret\n'
 emits  "imm32 boundaries" \
        "48 81 c0 ff ff ff 7f 48 81 e8 00 00 00 80 c3" \
        'add rax, 2147483647\nsub rax, -2147483648\nret\n'

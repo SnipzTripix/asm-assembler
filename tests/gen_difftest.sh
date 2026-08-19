@@ -54,6 +54,47 @@ for op in add sub and or xor cmp test imul; do
     done
 done
 
+# --- ALU reg,imm8: the 83 /digit form, for every register including rax
+#     (the accumulator short opcode only exists at imm32, so there is no
+#     collision here the way there is above) ---
+for op in add sub and or xor cmp; do
+    for d in $REGS; do
+        for v in 0 1 127 -1 -128; do
+            emit "$op $d, $v" "$op $d, $v"
+        done
+    done
+done
+# 128 and -129 are the first values on each side that must widen to
+# imm32; rax excluded again, where the reference takes the short opcode.
+for op in add sub and or xor cmp; do
+    for d in $REGS; do
+        [ "$d" = "rax" ] && continue
+        emit "$op $d, 128" "$op $d, 128"
+        emit "$op $d, -129" "$op $d, -129"
+    done
+done
+
+# --- mov reg,imm: three encodings by magnitude ---
+# A value that fits unsigned 32 bits goes in the five-byte B8+r form,
+# because writing a 32-bit register zero-extends into the full 64. GNU as
+# spells that `mov eax, 1` and reserves `mov rax, 1` for the seven-byte
+# sign-extended C7 form, so the reference side names the 32-bit register
+# -- same architectural effect, and the bytes have to match exactly.
+r32() { case $1 in
+    rax) echo eax;; rcx) echo ecx;; rdx) echo edx;; rbx) echo ebx;;
+    rsp) echo esp;; rbp) echo ebp;; rsi) echo esi;; rdi) echo edi;;
+    *) echo "${1}d";; esac; }
+for d in $REGS; do
+    e=$(r32 "$d")
+    for v in 0 1 255 65535 0x7fffffff 0xffffffff; do
+        emit "mov $d, $v" "mov $e, $v"
+    done
+    emit "mov $d, -1"           "mov $d, -1"
+    emit "mov $d, -2147483648"  "mov $d, -2147483648"
+    emit "mov $d, 4294967296"   "movabs $d, 4294967296"
+    emit "mov $d, -2147483649"  "movabs $d, -2147483649"
+done
+
 # --- unary forms ---
 for d in $REGS; do
     emit "neg $d"    "neg $d"

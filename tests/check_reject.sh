@@ -80,6 +80,44 @@ reject "db over 8 bits"          'db 300\n'
 reject "dw over 16 bits"         'dw 0x12345\n'
 reject "dd over 32 bits"         'dd 0x1234567890\n'
 
+echo "--- diagnostics must name the thing that is wrong ---"
+# Each of these used to report something true but useless.
+printf '%%macro foo 1\nret\n' > "$D/t.v0"
+if $V "$D/t.v0" "$D/t.bin" 2>"$D/e"; then
+    echo "FAIL: %macro accepted"; fail=1
+elif grep -q 'macro' "$D/e"; then
+    echo "ok   unknown %% directive names itself -- $(cat "$D/e")"
+else
+    echo "FAIL: %macro reported as [$(cat "$D/e")]"; fail=1
+fi
+printf '%%include "no_such_file.inc"\nret\n' > "$D/t.v0"
+if $V "$D/t.v0" "$D/t.bin" 2>"$D/e"; then
+    echo "FAIL: missing include accepted"; fail=1
+elif grep -q 'no_such_file.inc' "$D/e"; then
+    echo "ok   missing include names the file -- $(cat "$D/e")"
+else
+    echo "FAIL: missing include reported as [$(cat "$D/e")]"; fail=1
+fi
+
+echo "--- assembling a file over itself must not destroy it ---"
+# This exited 0 and produced a working binary, having overwritten the
+# source with it. Both spellings of the same file have to be caught, so
+# the check compares device and inode rather than the path strings.
+printf 'mov rax, 60\nmov rdi, 0\nsyscall\n' > "$D/self.v0"
+before=$(wc -c < "$D/self.v0")
+if (cd "$D" && "$OLDPWD/$V" self.v0 self.v0 2>/dev/null); then
+    echo "FAIL: assembled over its own input"; fail=1
+else
+    [ "$(wc -c < "$D/self.v0")" = "$before" ] \
+        && echo "ok   refused, source intact ($before bytes)" \
+        || { echo "FAIL: source was modified anyway"; fail=1; }
+fi
+if (cd "$D" && "$OLDPWD/$V" ./self.v0 self.v0 2>/dev/null); then
+    echo "FAIL: ./x and x not recognised as the same file"; fail=1
+else
+    echo "ok   ./x and x recognised as the same file"
+fi
+
 echo "--- still accepted: these are valid and must keep working ---"
 value  "comment after statement" 7 'mov rdi, 7   ; trailing comment\nmov rax, 60\nsyscall\n'
 value  "tabs and spaces"         9 '\tmov  rdi,\t9\n\tmov rax, 60\n\tsyscall\n'

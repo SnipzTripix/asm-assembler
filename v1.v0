@@ -112,6 +112,8 @@ SYS_read        equ 0
 SYS_write       equ 1
 SYS_open        equ 2
 SYS_close       equ 3
+SYS_fstat       equ 5                   ; struct stat: st_dev at 0, st_ino at 8
+SYS_stat        equ 4
 SYS_mmap        equ 9
 SYS_fork        equ 57
 SYS_exit        equ 60
@@ -164,6 +166,8 @@ INPUT_FD_OFF    equ 0xD800028            ; argv[1]-opened fd, else 0 (stdin)
 OUTPUT_FD_OFF   equ 0xD800030            ; 1 (stdout) until the real file is
                                           ; opened, which happens only once
                                           ; there is output to write
+STATBUF_IN_OFF  equ 0xD800600            ; two struct stat buffers (144 B each),
+STATBUF_OUT_OFF equ 0xD800700            ; used once to compare device+inode
 OUTFMT_OFF      equ 0xD800508            ; 0 = flat ELF executable,
                                           ; 1 = ET_REL object (-f elf64)
 OUTPATH_OFF     equ 0xD800500            ; argv[2], or 1 when writing stdout.
@@ -690,6 +694,8 @@ mov [rax+0], r11
 mov rax, rbx
 add rax, OUTFMT_OFF
 mov [rax+0], r9
+call check_not_same_file
+
 mov rax, rbx
 add rax, MYJOB_OFF                  ; the parent is not a worker; workers
 mov rcx, NEG_ONE                    ; overwrite this with their index
@@ -2084,6 +2090,66 @@ mov rax, SYS_exit
 syscall
 
 ; ===========================================================================
+; check_not_same_file -- refuse to assemble a file over itself.
+;
+; `./v1 prog.v0 prog.v0` used to succeed: it read the source, assembled
+; it correctly, and then wrote the ELF binary over the source. Exit 0, a
+; working program, and the input gone. The output file is opened lazily
+; and only once there is something to write, so nothing detects the
+; collision on its own -- by then the source has already been read and
+; the truncation looks like an ordinary successful write.
+;
+; Comparing the two path strings is not enough (`./x.v0` and `x.v0` name
+; the same file), so this compares device and inode: fstat on the input
+; fd, stat on the output path. A stat that fails means the output does
+; not exist yet, which is the common case and is exactly what we want.
+; Only reached when both sides are real files -- stdin and stdout cannot
+; collide this way.
+; ===========================================================================
+check_not_same_file:
+mov rax, rbx
+add rax, INPUT_FD_OFF
+mov rdi, [rax+0]
+cmp rdi, 0
+je cnsf_ok                          ; reading stdin
+mov rax, rbx
+add rax, OUTPATH_OFF
+mov rsi, [rax+0]
+cmp rsi, 1
+je cnsf_ok                          ; writing stdout
+push rsi
+mov rsi, rbx
+add rsi, STATBUF_IN_OFF
+mov rax, SYS_fstat
+syscall
+pop rsi
+cmp rax, 0
+jl cnsf_ok                          ; unstattable input: let the read fail
+mov rdi, rsi
+mov rsi, rbx
+add rsi, STATBUF_OUT_OFF
+mov rax, SYS_stat
+syscall
+cmp rax, 0
+jl cnsf_ok                          ; no such output file yet
+mov rax, rbx
+add rax, STATBUF_IN_OFF
+mov rcx, [rax+0]                    ; st_dev
+mov rdx, [rax+8]                    ; st_ino
+mov rax, rbx
+add rax, STATBUF_OUT_OFF
+mov rsi, [rax+0]
+cmp rcx, rsi
+jne cnsf_ok
+mov rsi, [rax+8]
+cmp rdx, rsi
+jne cnsf_ok
+mov rdi, msg_samefile
+jmp die
+cnsf_ok:
+ret
+
+; ===========================================================================
 ; skip_ws -- advance r13 past spaces/tabs only (not newline)
 ; ===========================================================================
 skip_ws:
@@ -3156,13 +3222,13 @@ expand_found:
 mov r9, r13                        ; r9 = start of the directive line
 add r13, 1
 call scan_ident
-cmp rcx, 7
-jne die_bad_include
-mov rdi, lit_include
-mov rdx, 7
-call bytes_eq
-cmp rax, 1
-jne die_bad_include
+cmp rcx, 7                         ; %include is the only % directive this
+jne die_unknown_pct                ; dialect has. Reporting "malformed
+mov rdi, lit_include               ; %include" for %macro or %define named
+mov rdx, 7                         ; the wrong problem entirely and sent
+call bytes_eq                      ; the reader looking for a missing
+cmp rax, 1                         ; quote; the name is what they need
+jne die_unknown_pct                ; to hear.
 call skip_ws
 cmp r13, r12
 jae die_bad_include
@@ -3240,11 +3306,13 @@ ret
 ; syscall in either. (The caller saves r9 across this call; r8, which
 ; holds the expansion counter, is left alone here.)
 read_include:
-mov rsi, O_RDONLY
-mov rax, SYS_open
-syscall
-cmp rax, 0
-jl die_open
+push rdi                           ; the path, kept so a failure can name
+mov rsi, O_RDONLY                  ; it: "could not open input or output
+mov rax, SYS_open                  ; file" is the argv-level message and
+syscall                            ; says nothing about which include is
+pop rdi                            ; missing, which is the only thing the
+cmp rax, 0                         ; reader needs to know
+jl die_include_open
 mov r10, rax                       ; fd
 mov r9, 0                          ; bytes so far
 read_include_loop:
@@ -5197,6 +5265,19 @@ push rax                         ; the 81 /digit form carries only imm32
 mov rax, r9                      ; (sign-extended at run time), so anything
 call check_imm32                 ; wider than signed 32 bits cannot be
 pop rax                          ; encoded here and must not be truncated
+
+; 83 /digit takes a single sign-extended byte and covers the immediates
+; that actually occur -- `add rax, 1` is four bytes this way and seven
+; the other. Decided here and now from a value that is already known, so
+; no address moves: the same argument that makes disp8 safe.
+mov rcx, r9
+shr rcx, 7
+cmp rcx, 0
+je egi_imm8
+mov rsi, 0x1FFFFFFFFFFFFFF        ; 2^57-1: sign bit and everything above
+cmp rcx, rsi
+je egi_imm8
+
 mov rcx, 0x48
 mov rsi, rax
 shr rsi, 3
@@ -5217,6 +5298,107 @@ mov rdi, r15
 add rdi, 3
 mov rax, r9
 call store_dword
+add r15, 7
+ret
+
+egi_imm8:
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rsi, 0x83
+movb [r15+1], rsi
+mov rsi, rax
+and rsi, 7
+mov rdi, r10
+shl rdi, 3
+add rsi, rdi
+add rsi, 0xC0
+movb [r15+2], rsi
+movb [r15+3], r9
+add r15, 4
+ret
+
+; ===========================================================================
+; emit_mov_imm -- the shortest encoding of `mov r64, imm`.
+;   in: rax = dst reg, r10 = value.  out: r15 += 5, 6, 7 or 10
+;
+;   0 .. 0xFFFFFFFF    B8+r imm32, no REX.W -- writing a 32-bit register
+;                      zero-extends into the full 64, so the wider form
+;                      buys nothing. Five bytes where ten were emitted.
+;   -2^31 .. -1        REX.W C7 /0 imm32, sign-extended: seven bytes.
+;   anything else      REX.W B8+r imm64: the only form that fits.
+;
+; GNU as spells the first case `mov eax, 1` and gives `mov rax, 1` the
+; seven-byte C7 form; both encode the same architectural effect, and the
+; differential test pairs ours against the encoding that matches it
+; rather than pretending the two spellings must agree.
+; ===========================================================================
+emit_mov_imm:
+mov rcx, r10
+shr rcx, 32
+cmp rcx, 0
+je emi_u32
+mov rsi, r10
+shr rsi, 31
+mov rdi, 0x1FFFFFFFF
+cmp rsi, rdi
+je emi_s32
+
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rcx, rax
+and rcx, 7
+add rcx, 0xB8
+movb [r15+1], rcx
+mov [r15+2], r10
+add r15, 10
+ret
+
+emi_u32:
+mov rcx, rax
+shr rcx, 3
+cmp rcx, 0
+je emi_u32_norex
+mov rcx, 0x41                     ; REX.B alone: W stays 0 deliberately
+movb [r15+0], rcx
+add r15, 1
+emi_u32_norex:
+mov rcx, rax
+and rcx, 7
+add rcx, 0xB8
+movb [r15+0], rcx
+mov rdi, r15
+add rdi, 1
+push rax
+mov rax, r10
+call store_dword
+pop rax
+add r15, 5
+ret
+
+emi_s32:
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rcx, 0xC7
+movb [r15+1], rcx
+mov rcx, rax
+and rcx, 7
+add rcx, 0xC0
+movb [r15+2], rcx
+mov rdi, r15
+add rdi, 3
+push rax
+mov rax, r10
+call store_dword
+pop rax
 add r15, 7
 ret
 
@@ -5417,6 +5599,11 @@ call try_resolve_const
 cmp rdx, 0
 jne do_mov_const_have_value
 
+; A label reference keeps the full ten-byte imm64 form even when the
+; address would fit in less. It has to: the value is not known yet, and
+; the placeholder's width is what reserves room for it. That is the one
+; place a short immediate cannot be chosen, and it is the same constraint
+; as rel8 -- an unknown value, not a known one.
 call find_or_create_symbol        ; not a constant -- forward-capable label
 mov r11, rax                      ; sym slot address
 pop rax
@@ -5448,36 +5635,14 @@ jmp do_mov_tail
 do_mov_const_have_value:
 mov r10, rax                      ; constant's value
 pop rax                           ; dst reg
-mov r11, rax
-mov rax, 0x48
-mov rcx, r11
-shr rcx, 3
-add rax, rcx
-movb [r15+0], rax
-mov rcx, r11
-and rcx, 7
-add rcx, 0xB8
-movb [r15+1], rcx
-mov [r15+2], r10
-add r15, 10
+call emit_mov_imm
 jmp do_mov_tail
 
 do_mov_imm_numeric:
 call parse_signed_imm
 mov r10, rax
 pop rax
-mov r11, rax
-mov rax, 0x48
-mov rcx, r11
-shr rcx, 3
-add rax, rcx
-movb [r15+0], rax
-mov rcx, r11
-and rcx, 7
-add rcx, 0xB8
-movb [r15+1], rcx
-mov [r15+2], r10
-add r15, 10
+call emit_mov_imm
 jmp do_mov_tail
 
 do_mov_regreg_have_src:
@@ -6966,6 +7131,38 @@ call write_cstr_fd2
 mov rdi, 1
 mov rax, SYS_exit
 syscall
+; die_include_open -- rdi = the NUL-terminated path that would not open.
+die_include_open:
+push rdi
+mov rdi, msg_noinclude
+call write_cstr_fd2
+pop rdi
+call write_cstr_fd2
+mov rdi, msg_nl
+call write_cstr_fd2
+mov rdi, 1
+mov rax, SYS_exit
+syscall
+
+; die_unknown_pct -- rsi/rcx = the directive name, without its '%'. Runs
+; during include expansion, before any line counting, so like
+; die_undef_named it reports the name rather than a position.
+die_unknown_pct:
+push rsi
+push rcx
+mov rdi, msg_unknownpct
+call write_cstr_fd2
+pop rdx
+pop rsi
+mov rdi, 2
+mov rax, SYS_write
+syscall
+mov rdi, msg_nl
+call write_cstr_fd2
+mov rdi, 1
+mov rax, SYS_exit
+syscall
+
 die_toomany_syms:
 mov rdi, msg_toomanysyms
 jmp die_at_line
@@ -7174,6 +7371,16 @@ db 10
 db 0
 msg_write:
 db "v1: write failed"
+db 10
+db 0
+msg_noinclude:
+db "v1: cannot open included file: "
+db 0
+msg_unknownpct:
+db "v1: unknown directive: %"
+db 0
+msg_samefile:
+db "v1: input and output are the same file"
 db 10
 db 0
 msg_relconst:
