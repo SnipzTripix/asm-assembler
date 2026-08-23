@@ -23,16 +23,19 @@
 # The earlier version of this file claimed "every parallel test goes
 # through this rather than being run directly" while nothing anywhere
 # called it. run_all.sh runs every suite through it now.
+# coreutils timeout, not a hand-rolled watchdog. The hand-rolled one was
+# `( sleep N; kill $pid ) &` plus a kill of that subshell afterwards --
+# which kills the subshell and leaves the sleep running, holding the
+# write end of whatever pipe the suite was writing to. One orphan per
+# test, so `run_all.sh > file` finished in 6 seconds and
+# `run_all.sh | tail` sat there for three minutes waiting on EOF from
+# twenty sleeps. It also called every signal death a timeout, since it
+# only checked for status >= 128.
 TIMEOUT=${SAFE_TIMEOUT:-180}
-"$@" &
-pid=$!
-( sleep "$TIMEOUT"; kill -9 "$pid" 2>/dev/null ) &
-watchdog=$!
-wait "$pid"; rc=$?
-kill "$watchdog" 2>/dev/null
-wait "$watchdog" 2>/dev/null
-if [ "$rc" -ge 128 ]; then
-    echo "TIMED OUT or killed after ${TIMEOUT}s: $*"
+timeout -k 5 "$TIMEOUT" "$@"
+rc=$?
+if [ "$rc" -eq 124 ]; then
+    echo "TIMED OUT after ${TIMEOUT}s: $*"
     exit 1
 fi
 exit "$rc"

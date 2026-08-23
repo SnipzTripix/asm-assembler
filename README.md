@@ -81,15 +81,18 @@ the dialect grows, so it's the source of truth, not this file. Briefly:
   constant already defined, so `B equ A` aliases), `label:` definitions,
   `resb`
 - memory operands `[base+disp]` and `[base+index*scale+disp]`
-- `.text`/`.data`/`.bss` — real ELF segments: R+X, R, and a
-  zero-filled RW mapping that costs nothing in the file
+- `.text`/`.data`/`.bss` — real ELF segments: R+X, RW, and a
+  zero-filled RW mapping that costs nothing in the file. `jmp reg` is
+  not supported, though `call reg` is
 - `%include "file"`, nesting supported
 - `global NAME` / `extern NAME` for object output
 - `[-f elf64]`, then filenames, then a worker count
 
-Not yet implemented: arithmetic at widths other than 64-bit (memory
-access has `movb`/`movw`/`movd`; the ALU ops are always full-width),
-RIP-relative addressing, and short (`rel8`) jumps.
+Not yet implemented: 32/16/8-bit register operands (`mov eax, ebx` is a
+syntax error) and ALU ops at any width but 64 (memory access has
+`movb`/`movw`/`movd`, but `add eax, 1` is unexpressible), RIP-relative
+addressing, and short (`rel8`) jumps. That first one is the wall between
+this and assembling compiler output.
 
 `rel8` is a deliberate omission. Picking it requires knowing whether the
 target is within 127 bytes, which isn't known when the instruction is
@@ -235,6 +238,17 @@ paid all sixteen before being rejected. Character classification is a
 branchless 256-byte lookup table.
 
 On a 100k-line / 1.25 MB source file: ~15 ms (i9-13900KS).
+
+One caveat on all of these, learned the expensive way. This binary's
+statement loop is sensitive to where it lands in memory: adding ~300
+bytes of unrelated code elsewhere in `.text` moved self-assembly by 26%,
+and a *seven-byte* shift was enough to hold the difference. That is a hot
+loop crossing a 32-byte boundary, and the dialect has no `align`
+directive to pin it with — so any measurement of a change smaller than
+that is measuring placement, not the change. Two consequences worth
+stating: benchmark warmed and interleaved (a cold-cache run showed one
+change as a 19% win that warmed runs showed as a 19% loss), and treat
+sub-30% differences here as unattributable until `align` exists.
 
 Against the assemblers it is not trying to replace, same 3.83 MB /
 300,003-statement input, best of three:

@@ -37,6 +37,9 @@ run_prog() {
 echo "=== smoke: the documented invocations ==="
 ./tests/safe.sh ./tests/check_smoke.sh "$V" || fail=1
 
+echo "=== command line ==="
+./tests/safe.sh ./tests/check_cli.sh "$V" || fail=1
+
 echo "=== memory layout constants do not overlap ==="
 ./tests/safe.sh ./tests/check_layout.sh || fail=1
 

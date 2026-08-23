@@ -185,8 +185,11 @@ TEXTBUF_OFF     equ 0x4000000            ; 64 MiB text capacity
 DATABUF_OFF     equ 0x8000000            ; 64 MiB data capacity
 TEXTBUF_CAP     equ 0x4000000
 DATABUF_CAP     equ 0x4000000
-SYMTAB_META_OFF equ 0xC000000
-SYMTAB_OFF      equ 0xC000008
+SYMTAB_META_OFF equ 0xD800540            ; symbol slots still available. It sat
+                                          ; at 0xC000000, sharing a cache line
+                                          ; with the first symbol slot.
+SYMTAB_OFF      equ 0xC000008            ; SYM_CAP * SYM_ENT of open-addressed
+                                          ; slots, through 0xD000008
 FIXUPS_META_OFF equ 0xD001000            ; the symtab is SYM_CAP * SYM_ENT
 FIXUPS_OFF      equ 0xD001008            ; from 0xC000008, i.e. through
                                           ; 0xD000008 -- so this used to
@@ -307,8 +310,12 @@ OBJ_OFF_SYM     equ 0x15232060
 OBJ_OFF_STR     equ 0x15232068
 OBJ_OFF_SHSTR   equ 0x15232070
 OBJ_OFF_SHDR    equ 0x15232078
+GLOBLIST_OFF    equ 0x15233000           ; slots named by `global`, checked at
+GLOBLIST_META_OFF equ 0x15234000         ; end of file: the directive can name
+GLOBLIST_CAP    equ 8192                 ; a symbol defined later, so nothing
+                                          ; can be decided when it is parsed
 
-MMAP_TOTAL      equ 0x15240000           ; through the end of the object
+MMAP_TOTAL      equ 0x15250000           ; through the end of the object
                                           ; scratch (INCBUF ends at
                                           ; 0x13230000)
 
@@ -631,10 +638,11 @@ cmp rcx, CH_MINUS
 jne start_have_format
 movb rcx, [rsi+1]
 cmp rcx, CH_f
-jne start_have_format
-movb rcx, [rsi+2]
-cmp rcx, 0
-jne start_have_format
+jne die_bad_flag                    ; a leading '-' that is not -f is a
+movb rcx, [rsi+2]                   ; flag we do not have, not a filename.
+cmp rcx, 0                          ; `-x in.v0 out` reported "could not
+jne die_bad_flag                    ; open input or output file", which
+                                    ; sends the reader to look at the file
 mov rsi, [rsp+24]                   ; the only format word accepted; argv
 mov rcx, [rsi+0]                    ; strings sit next to each other, so
 mov rdx, 0xFFFFFFFFFFFF             ; reading 8 bytes of a 6-byte one is
@@ -695,12 +703,18 @@ mov rsi, rsp
 add rsi, r10
 mov rsi, [rsi+16]                   ; worker count
 mov r11, 0
+; The count must be digits and nothing else. `-j abc`, `-j -1` and
+; `-j 3.5` all used to fall out of this loop at the first non-digit and
+; quietly become 1 or a truncated number, so a typo in a build script
+; turned a parallel build serial with nothing said about it.
 start_jobs_digit:
 movb rax, [rsi+0]
+cmp rax, 0
+je start_jobs_check
 cmp rax, CH_0
-jl start_jobs_check
+jl die_bad_jobs
 cmp rax, CH_9PLUS1
-jae start_jobs_check
+jae die_bad_jobs
 sub rax, CH_0
 mov rcx, r11
 shl r11, 3
@@ -711,15 +725,13 @@ add rsi, 1
 jmp start_jobs_digit
 start_jobs_check:
 cmp r11, 1
-jl start_jobs_bad
+jl die_bad_jobs                     ; an empty argument, or zero
 cmp r11, MAX_JOBS
 jae start_jobs_clamp
 jmp start_jobs_done
 start_jobs_clamp:
-mov r11, MAX_JOBS
-jmp start_jobs_done
-start_jobs_bad:
-mov r11, 1
+mov r11, MAX_JOBS                   ; more workers than slots is a request
+                                    ; to use everything, not an error
 start_jobs_done:
 
 push r9                             ; the output format, which mmap is
@@ -761,10 +773,6 @@ call check_not_same_file
 mov rax, rbx
 add rax, MYJOB_OFF                  ; the parent is not a worker; workers
 mov rcx, NEG_ONE                    ; overwrite this with their index
-mov [rax+0], rcx
-mov rax, rbx
-add rax, SYMMASK_OFF                ; full-size table unless a worker
-mov rcx, SYM_CAP_MASK               ; narrows it for itself
 mov [rax+0], rcx
 
 ; --- MAP_SHARED result area, only when actually running parallel ---
@@ -861,6 +869,10 @@ mov rcx, 1
 mov [rax+0], rcx
 call expand_includes               ; splice included files in before any
                                     ; parsing, chunking or line counting
+mov rdx, SYM_CAP_MASK               ; the full table. Sizing this to the
+                                    ; input was tried and reverted -- see the
+                                    ; note above set_sym_mask.
+call set_sym_mask
 serial_init:                        ; re-entered when parallel assembly
                                     ; gives up and hands the file back (see
                                     ; par_assemble); everything the prescan
@@ -979,6 +991,8 @@ mov rax, [rax+0]
 cmp rax, NEG_ONE
 jne par_worker_emit
 
+call check_globals_defined          ; before the format branch: an undefined
+                                    ; global is a mistake in either mode
 mov rax, rbx                        ; an object leaves its label references
 add rax, OUTFMT_OFF                 ; to the linker instead of settling
 mov rax, [rax+0]                    ; them here -- that is what makes it
@@ -1885,16 +1899,46 @@ ret
 ; obj_put -- rsi = bytes, rdx = length. A zero length is a no-op rather
 ; than a zero-byte write, which some file types treat as end-of-file.
 obj_put:
+call write_all
+ret
+
+; ===========================================================================
+; write_all -- in: rsi = bytes, rdx = length. Writes all of it, or dies.
+;
+; Every write site treated "the kernel wrote fewer bytes than asked" as
+; success, so a short write would have produced a truncated executable
+; and exit 0 -- the exact silent-wrong-output failure this whole file is
+; built to refuse, sitting in the one place nobody looks. It is not
+; reachable today: blocking writes to a regular file or a pipe complete,
+; and nothing here installs a signal handler, so there is no EINTR to
+; cut one short. "Currently unreachable" is not "cannot happen", and the
+; loop is shorter than this comment.
+;
+; A return of zero with bytes still to write means no progress is being
+; made; looping on that would hang instead of failing, so it is an error.
+;   clob: rax, rcx, rdx, rsi, rdi, r11 (r8/r9/r10 survive, and the
+;   callers rely on that)
+; ===========================================================================
+write_all:
 cmp rdx, 0
-je obj_put_ret
+je write_all_done
 mov rdi, rbx
 add rdi, OUTPUT_FD_OFF
 mov rdi, [rdi+0]
 mov rax, SYS_write
 syscall
 cmp rax, 0
-jl die_write
-obj_put_ret:
+jl write_all_err
+je die_write
+add rsi, rax                       ; advance past what actually went out
+sub rdx, rax
+jmp write_all
+write_all_err:
+mov rcx, NEG_FOUR                  ; -EINTR: nothing was written, ask again
+cmp rax, rcx
+je write_all
+jmp die_write
+write_all_done:
 ret
 
 build_output:
@@ -2068,8 +2112,15 @@ push r8
 mov rdx, rbx
 add rdx, BSS_VADDR_OFF
 mov rdx, [rdx+0]                    ; vaddr offset
-mov rsi, rax
-add rsi, rdi                        ; p_offset: just past .data in the file
+; p_offset = 0, not "just past .data". The ABI requires
+; p_offset == p_vaddr modulo p_align for every PT_LOAD, and .bss's vaddr
+; is page-aligned while the end of .data is wherever .data happened to
+; stop -- so with a non-empty .data the two disagreed (0x1001 against
+; 0x402000) and the segment was non-conformant. Linux never noticed
+; because filesz is 0, so nothing is mapped from the file and the offset
+; is not consulted; a stricter loader or elflint is entitled to reject
+; it. Zero satisfies the congruence for any alignment and reads nothing.
+mov rsi, 0                          ; p_offset
 mov r9, r8                          ; memsz = reserved size
 mov r8, 0                           ; filesz = 0
 mov rdi, r12
@@ -2149,13 +2200,7 @@ out_is_stdout:
 
 mov rdx, r9
 mov rsi, r14
-mov rdi, rbx
-add rdi, OUTPUT_FD_OFF
-mov rdi, [rdi+0]
-mov rax, SYS_write
-syscall
-cmp rax, 0
-jl die_write
+call write_all
 
 ; An empty .data needs neither the alignment padding nor a data write --
 ; without this the output of every section-less program was rounded up to
@@ -2167,24 +2212,12 @@ mov rdx, r8
 sub rdx, r9                         ; padding_size = DATA_FILE_START - text_size
 mov rsi, r14
 add rsi, r9                         ; source = r14+text_size (zero there)
-mov rdi, rbx
-add rdi, OUTPUT_FD_OFF
-mov rdi, [rdi+0]
-mov rax, SYS_write
-syscall
-cmp rax, 0
-jl die_write
+call write_all
 
 mov rdx, r10
 mov rsi, rbx
 add rsi, DATABUF_OFF
-mov rdi, rbx
-add rdi, OUTPUT_FD_OFF
-mov rdi, [rdi+0]
-mov rax, SYS_write
-syscall
-cmp rax, 0
-jl die_write
+call write_all
 write_done:
 
 ; --- close whichever fds we actually opened (argv-provided ones only --
@@ -2896,6 +2929,59 @@ add rdx, SYMMASK_OFF
 mov rdx, [rdx+0]
 and r9, rdx
 jmp focs_probe
+; ===========================================================================
+; set_sym_mask -- in: rdx = the probe mask (slots-1) for this process.
+; Stores it, and stores the population ceiling beside it so focs_create
+; never has to derive one. 7/8 of the slots, because open addressing
+; degrades badly above that.
+;
+; The ceiling has to come from the mask actually being probed with. It
+; used to be the fixed SYM_POP_MAX, derived from the whole table, while a
+; worker probes a narrowed one -- so a worker could fill its own small
+; table completely and keep inserting, and focs_probe, finding no empty
+; slot anywhere, walked the ring forever. Every core busy, no output, no
+; diagnostic, no end.
+;   clob: rax, rcx
+;
+; Sizing this mask to the input was tried here and reverted. The idea is
+; sound and the problem it targets is real -- the serial path scatters
+; symbols across the full 16 MiB and pays first-touch faults for all of
+; it, so a small file's first thousand labels cost ~1600 ns each against
+; ~85 ns in steady state. Deriving the mask from the input length (a
+; label needs at least three bytes, so N bytes hold fewer than N/3 of
+; them) is a correct bound and cost nothing to compute.
+;
+; It measured 19% SLOWER on self-assembly, and the reason is not the
+; table. On a comment-only file -- zero symbols, and an input large
+; enough that the computed mask came out identical to SYM_CAP_MASK
+; anyway -- the same 43% gap appeared. Same mask, same budget, no symbol
+; ever inserted: the only thing that differed was where the forty lines
+; of arithmetic put everything after them in .text. Moving the block
+; below the statement loop did not help either; a seven-byte shift was
+; enough to keep it.
+;
+; That is a hot loop straddling a 32-byte boundary, and this dialect has
+; no `align` directive to pin it with. Until it does, a change of this
+; shape is a coin flip worth up to 40% in either direction, which is not
+; a thing to ship on the strength of reasoning about page faults. The
+; measurement harness matters too: cold-cache runs showed this change as
+; a 19% WIN, and only warmed, interleaved, best-of runs showed the loss.
+; ===========================================================================
+
+set_sym_mask:
+mov rax, rbx
+add rax, SYMMASK_OFF
+mov [rax+0], rdx
+mov rax, rdx
+add rax, 1                          ; slots
+mov rcx, rax
+shr rcx, 3
+sub rax, rcx                        ; 7/8 of them
+mov rcx, rbx
+add rcx, SYMTAB_META_OFF
+mov [rcx+0], rax                    ; slots still available, counted DOWN
+ret
+
 focs_create:
 ; The ceiling has to come from the mask this process is actually probing
 ; with, not from the full table's SYM_POP_MAX. A worker narrows its mask
@@ -2905,19 +2991,17 @@ focs_create:
 ; slot anywhere, then walked the ring forever. Every core pinned, no
 ; output, no diagnostic, no end. 7/8 because open addressing degrades
 ; badly above that, which is where SYM_POP_MAX came from too.
-mov r11, rbx
-add r11, SYMMASK_OFF
-mov r11, [r11+0]
-add r11, 1                      ; slots in THIS process's table
-mov rdx, r11
-shr rdx, 3
-sub r11, rdx                    ; 7/8 of them
+; A remaining-slots budget rather than a population counted up against a
+; ceiling: one load and one store, the same memory traffic the fixed
+; SYM_POP_MAX compare had, with none of its wrongness. Counting up meant
+; reading the ceiling too, and when the two lived in different regions
+; that was a second cache line on every insertion.
 mov rdx, rbx
-add rdx, SYMTAB_META_OFF        ; repurposed as a population counter --
-mov rax, [rdx+0]                ; the hash table has no "count of live
-cmp rax, r11                    ; entries scanned so far" to track otherwise
-jae die_toomany_syms
-add rax, 1
+add rdx, SYMTAB_META_OFF
+mov rax, [rdx+0]
+cmp rax, 0
+je die_toomany_syms
+sub rax, 1
 mov [rdx+0], rax
 mov [r10+0], r8
 mov [r10+8], rsi
@@ -4255,9 +4339,7 @@ shr rcx, 1
 jmp pscw_shift
 pscw_masked:
 sub rdx, 1                         ; slots-1 = mask
-mov rax, rbx
-add rax, SYMMASK_OFF
-mov [rax+0], rdx
+call set_sym_mask
 call par_install_consts
 jmp stmt_loop
 par_spawn_next:
@@ -4601,10 +4683,14 @@ mov rcx, rbx
 add rcx, FIXUPS_OFF
 add rax, rcx                       ; rax = fixup record
 mov rdx, r9                        ; *48 as (x<<5)+(x<<4): this dialect has
-shl rdx, 5                         ; only two-operand imul, and the
-mov rsi, r9                        ; three-operand form silently assembles
-shl rsi, 4                         ; as `imul rdx, rdx` with the constant
-add rdx, rsi                       ; dropped -- a wrong stride, not an error
+shl rdx, 5                         ; only two-operand imul, so the stride
+mov rsi, r9                        ; is built from shifts. (This comment
+shl rsi, 4                         ; used to claim the three-operand form
+add rdx, rsi                       ; assembles silently with the constant
+                                   ; dropped. It did once; expect_eol
+                                   ; rejects it now, and a comment that
+                                   ; documents a bug that no longer exists
+                                   ; is worse than no comment.)
 mov rdi, [rsp+0]
 add rdi, SLOT_FIX_OFF
 add rdi, rdx                       ; rdi = shared entry
@@ -6714,7 +6800,60 @@ je die_bad_operand
 call find_or_create_symbol
 mov rcx, SYMB_GLOBAL
 mov [rax+48], rcx
+; Record it for the end-of-file check. `global foo` with no `foo:`
+; anywhere used to assemble to nothing at all: exit 0, no symbol, no
+; diagnostic, and a link failure much later naming a symbol the user
+; thought they had exported. It cannot be decided here, because the
+; definition is allowed to come afterwards.
+push rax
+mov rax, rbx
+add rax, GLOBLIST_META_OFF
+mov rcx, [rax+0]
+cmp rcx, GLOBLIST_CAP
+jae die_toomany_syms
+mov rdx, rcx
+add rdx, 1
+mov [rax+0], rdx
+shl rcx, 3
+mov rdx, rbx
+add rdx, GLOBLIST_OFF
+add rdx, rcx
+pop rax
+mov [rdx+0], rax
 call expect_eol
+ret
+
+; ===========================================================================
+; check_globals_defined -- every name given to `global` has to exist by
+; the end of the file. Runs for flat output too: the directive has no
+; effect there, but naming a symbol that was never defined is a typo in
+; either mode, and silence is what made it one worth reporting.
+; ===========================================================================
+check_globals_defined:
+mov rax, rbx
+add rax, GLOBLIST_META_OFF
+mov r8, [rax+0]
+mov r9, 0
+cgd_loop:
+cmp r9, r8
+jae cgd_done
+mov rax, r9
+shl rax, 3
+mov rcx, rbx
+add rcx, GLOBLIST_OFF
+add rax, rcx
+mov rax, [rax+0]                   ; symbol slot
+mov rcx, [rax+32]                  ; status
+cmp rcx, 0
+je cgd_undef
+add r9, 1
+jmp cgd_loop
+cgd_undef:
+mov rcx, [rax+16]                  ; length first: rsi is about to become
+mov rsi, [rax+8]                   ; the name pointer
+mov rdi, msg_globalundef
+jmp die_named
+cgd_done:
 ret
 
 do_extern:
@@ -7454,6 +7593,12 @@ jmp die
 die_extern_flat:
 mov rdi, msg_externflat
 jmp die_at_line
+die_bad_jobs:
+mov rdi, msg_badjobs
+jmp die
+die_bad_flag:
+mov rdi, msg_badflag
+jmp die
 die_bad_format:
 mov rdi, msg_badformat
 jmp die
@@ -7474,9 +7619,12 @@ jmp die_at_line
 ; "v1: undefined label: NAME" and exits. No line number: by the time
 ; fixups are resolved the scan is over, and the name is the useful part.
 die_undef_named:
+mov rdi, msg_undef
+
+; die_named -- rdi = message, rsi/rcx = a name to append after ": ".
+die_named:
 push rsi
 push rcx
-mov rdi, msg_undef
 call write_cstr_fd2
 mov rdi, msg_colonsp
 call write_cstr_fd2
@@ -7738,6 +7886,9 @@ msg_write:
 db "v1: write failed"
 db 10
 db 0
+msg_globalundef:
+db "v1: global names a symbol that is never defined"
+db 0
 msg_nocode:
 db "v1: no code in .text -- a flat executable needs an entry point"
 db 10
@@ -7758,6 +7909,14 @@ db 10
 db 0
 msg_externflat:
 db "v1: extern requires -f elf64"
+db 0
+msg_badjobs:
+db "v1: worker count must be a positive decimal number"
+db 10
+db 0
+msg_badflag:
+db "v1: unknown option (only -f elf64 is accepted)"
+db 10
 db 0
 msg_badformat:
 db "v1: -f takes elf64 and nothing else"
