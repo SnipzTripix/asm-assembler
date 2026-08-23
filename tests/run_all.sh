@@ -30,6 +30,16 @@ run_prog() {
     rm -f "/tmp/rt_$name" "/tmp/rt_$name.err"
 }
 
+# First, and on its own: the invocation everything below depends on.
+# Every other test here runs `$V file.v0 file.out`, so when that shape
+# broke, the failure arrived as dozens of unrelated-looking FAILs with no
+# indication of the common cause.
+echo "=== smoke: the documented invocations ==="
+./tests/check_smoke.sh "$V" || fail=1
+
+echo "=== memory layout constants do not overlap ==="
+./tests/check_layout.sh || fail=1
+
 echo "=== programs ==="
 run_prog hello    0
 run_prog edge     7

@@ -173,16 +173,24 @@ writes and which the parent reads only after `wait4` says the worker is
 gone. Chunks are merged in index order, never completion order, so
 scheduling cannot affect the result.
 
-Measured on a 16-thread i5-13400F, warm cache, output to `/dev/null`,
-on a generated 3.83 MB source (`tests/par_scaling.sh`):
+Measured on a 32-thread i9-13900KS, warm cache, output to `/dev/null`,
+on a generated 3.83 MB / 300,003-statement source
+(`tests/par_scaling.sh`). Earlier revisions of this table were taken on
+a 16-thread i5-13400F; the whole table was re-measured on the new
+machine rather than scaled:
 
 | Workers | Wall | CPU/wall | Throughput |
 |---|---|---|---|
-| `-j1` | 34 ms | 0.97 | 113 MB/s |
-| `-j2` | 26 ms | 1.5 | 147 MB/s |
-| `-j4` | 18 ms | 2.1 | 213 MB/s |
-| `-j8` | 16 ms | 2.6 | 239 MB/s |
-| `-j16` | 15 ms | 3.2 | **255 MB/s** |
+| `-j1` | 28 ms | 0.96 | 137 MB/s |
+| `-j2` | 22 ms | 1.5 | 174 MB/s |
+| `-j4` | 15 ms | 1.9 | 255 MB/s |
+| `-j8` | 13 ms | 2.6 | 294 MB/s |
+| `-j16` | 12 ms | 3.1 | **319 MB/s** |
+
+`-j16` is where the table stops because `MAX_JOBS` is 16 and the worker
+count is clamped to it, which on a 32-thread machine now leaves half the
+CPU unused. Reading `sched_getaffinity` and clamping to that instead is
+the obvious fix and is not done yet.
 
 Files under 256 KB ignore the worker count and run serially — below that
 size, forking and merging cost more than they save. That threshold is
@@ -214,7 +222,26 @@ recognising `r15` cost sixteen function calls and every label operand
 paid all sixteen before being rejected. Character classification is a
 branchless 256-byte lookup table.
 
-On a 100k-line / 1.25 MB source file: ~18 ms.
+On a 100k-line / 1.25 MB source file: ~15 ms (i9-13900KS).
+
+Against the assemblers it is not trying to replace, same 3.83 MB /
+300,003-statement input, best of three:
+
+| | Wall | vs `v1 -j1` |
+|---|---|---|
+| `v1 -j16` | 11 ms | 2.5× |
+| `v1 -j1` | 27 ms | 1× |
+| GNU `as` | 254 ms | 9.4× slower |
+| `nasm -f elf64` | 1062 ms | 39× slower |
+| `nasm -f bin` | 1310 ms | 48× slower |
+
+Worth stating plainly what that does and does not show. It is a real,
+reproducible measurement of the same instructions through each tool, and
+it is not apples to apples: both references carry a macro preprocessor,
+an expression evaluator and multiple output formats that this input
+never exercises and `v1` does not have at all. Quoting only the nasm
+number would also flatter the result — GNU `as` is four to five times
+faster than nasm here, and it is the more honest comparison of the two.
 
 Two notes on measuring any of this, both learned the hard way:
 
@@ -325,6 +352,27 @@ v1: undefined label: nowhere_at_all
 
 Every error path exits nonzero with a distinct message on stderr — there
 are no assertion failures or segfaults on malformed input.
+
+Two invariants that have no natural test and so have an artificial one:
+
+- **Register discipline.** `syscall` overwrites `rcx` and `r11` — that's
+  the instruction, not the kernel — so any routine that might issue one
+  destroys them, whether or not that's visible at the call site. The same
+  mistake has now caused three separate bugs: a job count in `r11` across
+  `mmap` that became a fork bomb, a byte count in `r11` across `read`
+  that padded a buffer with NULs, and a job count in `r11` across an
+  `fstat` that asked for 16 GiB of shared memory and broke `./v1 in out`
+  on any machine that couldn't overcommit it. The convention is now
+  stated once at the top of `v1.v0`, and `tests/check_smoke.sh` runs the
+  documented invocations inside a 2 GiB address space — generous for a
+  real assembly, impossible for a bug of that shape.
+- **Memory layout.** Every region is a hand-picked absolute offset into
+  one mapping, and a wrong address there corrupts something unrelated
+  instead of faulting. `tests/check_layout.sh` reads the declared regions
+  out of `v1.v0` and asserts none overlap and all fit. It found two live
+  collisions the first time it ran: the last symbol slot's final field
+  sat on the fixup counter, and the last prescan constant's value sat on
+  the line-start pointer.
 
 The differential test against GNU `as` is what backs this up. It runs in
 two forms: a hand-written file covering every instruction form, and

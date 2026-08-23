@@ -104,6 +104,39 @@
 ;
 ; Mnemonic dispatch is SWAR (a masked-qword compare, see PACK_* below)
 ; bucketed by first letter.
+;
+; ---------------------------------------------------------------------------
+; REGISTER CONVENTION. Read this before adding a call anywhere.
+;
+; Held across everything, by every routine:
+;   rbx  base of the one big mmap; every *_OFF constant is an offset here
+;   r12  end of the input
+;   r13  input cursor
+;   r14  base of the text buffer
+;   r15  output cursor for whichever section is current
+;
+; Everything else -- rax rcx rdx rsi rdi r8 r9 r10 r11 -- is caller-saved.
+; A routine may clobber any of them unless its own header says otherwise,
+; and several do say otherwise. Nothing that must survive a call may live
+; in one of them without a push, and nothing that must survive an
+; arbitrary amount of code should live in one at all: put it in memory
+; and read it back.
+;
+; rcx and r11 are worse than caller-saved: `syscall` overwrites them by
+; definition of the instruction, r11 with the flags. So any routine that
+; might issue a syscall destroys them, whether or not that is visible at
+; the call site -- and whether a routine issues one can change later
+; without the call site being touched.
+;
+; This has now cost three separate bugs, each found in production rather
+; than by review: a job count in r11 across mmap that turned into a fork
+; bomb, a byte count in r11 across read that padded a buffer with NULs,
+; and a job count in r11 across an fstat that asked for 16 GiB of shared
+; memory and broke the primary invocation on any machine that could not
+; overcommit it. All three were the same mistake. The rule that prevents
+; it is above; the reason it is written here rather than at each call
+; site is that the call sites are where it keeps getting forgotten.
+; ---------------------------------------------------------------------------
 ; ===========================================================================
 
 ; --- syscall numbers / mmap flags ---
@@ -154,8 +187,15 @@ TEXTBUF_CAP     equ 0x4000000
 DATABUF_CAP     equ 0x4000000
 SYMTAB_META_OFF equ 0xC000000
 SYMTAB_OFF      equ 0xC000008
-FIXUPS_META_OFF equ 0xD000000            ; + 16MB symtab region
-FIXUPS_OFF      equ 0xD000008
+FIXUPS_META_OFF equ 0xD001000            ; the symtab is SYM_CAP * SYM_ENT
+FIXUPS_OFF      equ 0xD001008            ; from 0xC000008, i.e. through
+                                          ; 0xD000008 -- so this used to
+                                          ; begin eight bytes INSIDE the
+                                          ; last symbol slot, whose byte 56
+                                          ; is the object-file symbol index.
+                                          ; A name hashing to the final slot
+                                          ; under -f elf64 would have
+                                          ; overwritten the fixup count.
 LINE_OFF        equ 0xD800000            ; + 8MB fixups region
 CUR_SECTION_OFF equ 0xD800008            ; 0 = text (default), 1 = data
 SAVED_TEXT_R15_OFF equ 0xD800010         ; the OTHER section's cursor,
@@ -219,7 +259,12 @@ DEFLIST_OFF     equ 0xD900000            ; 8 MiB of symbol-slot pointers, one
                                           ; 16 MiB hash table to find them
                                           ; would cost more than the work it
                                           ; just did
-LINE_START_OFF  equ 0xE21FFF0            ; first byte of the current line,
+LINE_START_OFF  equ 0xD800510            ; first byte of the current line,
+                                          ; It sat at 0xE21FFF0, inside the
+                                          ; last entry of the prescan constant
+                                          ; array -- a file with 32768 equ
+                                          ; constants would have had its last
+                                          ; value aliased to this slot.
                                           ; for column numbers in errors
 MEM_INDEX_OFF   equ 0xE220000            ; parse_mem's index register, or
                                           ; NEG_ONE when the operand has none
@@ -717,10 +762,23 @@ mov rcx, SYM_CAP_MASK               ; narrows it for itself
 mov [rax+0], rcx
 
 ; --- MAP_SHARED result area, only when actually running parallel ---
+; The count is re-read from JOBS_OFF rather than trusted in r11. It was
+; trusted, and check_not_same_file was inserted above -- which issues
+; fstat and stat, and `syscall` leaves RFLAGS in r11 by definition of the
+; instruction. r11 came back as 0x206, so `cmp r11, 1` failed, the
+; parallel branch ran, and this asked the kernel for 518 << SLOT_SHIFT =
+; 16 GiB of MAP_SHARED memory. On a machine with room to overcommit that
+; silently succeeded and nothing was ever touched; on one without, every
+; `./v1 in.v0 out` -- the invocation the README leads with -- died with
+; "mmap failed". Memory is the authority for this value now, so no
+; future call inserted anywhere above can reintroduce it.
 mov rax, rbx
 add rax, SHARED_OFF
 mov rcx, 0
 mov [rax+0], rcx
+mov rax, rbx
+add rax, JOBS_OFF
+mov r11, [rax+0]
 cmp r11, 1
 je start_no_shared
 push r11
