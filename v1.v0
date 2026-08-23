@@ -259,6 +259,9 @@ DEFLIST_OFF     equ 0xD900000            ; 8 MiB of symbol-slot pointers, one
                                           ; 16 MiB hash table to find them
                                           ; would cost more than the work it
                                           ; just did
+PAR_GIVEUP_OFF  equ 0xD800518            ; set when the prescan finds the file
+                                          ; cannot be split; the parent then
+                                          ; assembles it serially
 LINE_START_OFF  equ 0xD800510            ; first byte of the current line,
                                           ; It sat at 0xE21FFF0, inside the
                                           ; last entry of the prescan constant
@@ -408,13 +411,13 @@ OUTFMT_FLAT     equ 0
 OUTFMT_OBJECT   equ 1
 
 ; --- ELF section/symbol/relocation constants, SysV gABI + x86-64 psABI ---
-OBJ_NSEC        equ 9                   ; NULL .text .data .bss .symtab
+OBJ_NSEC        equ 10                  ; NULL .text .data .bss .symtab
                                          ; .strtab .rela.text .rela.data
-                                         ; .shstrtab -- always all nine, even
-                                         ; when empty, so section indices are
-                                         ; constants instead of a running
-                                         ; count that has to agree with a
-                                         ; second one somewhere else
+                                         ; .shstrtab .note.GNU-stack -- always
+                                         ; all ten, even when empty, so section
+                                         ; indices are constants instead of a
+                                         ; running count that has to agree
+                                         ; with a second one somewhere else
 SEC_IDX_TEXT    equ 1
 SEC_IDX_DATA    equ 2
 SEC_IDX_BSS     equ 3
@@ -435,9 +438,12 @@ RELAENT         equ 24
 STB_LOCAL_INFO  equ 0                    ; st_info = bind<<4 | type, and the
 STB_GLOBAL_INFO equ 16                   ; type stays STT_NOTYPE throughout
 SHN_UNDEF       equ 0
+STT_OBJECT      equ 1                    ; st_info type: data
+STT_FUNC        equ 2                    ; st_info type: code
 R_X86_64_64     equ 1
 R_X86_64_PC32   equ 2
-SHSTR_LEN       equ 66                   ; the fixed .shstrtab blob below
+SEC_IDX_NOTE    equ 9
+SHSTR_LEN       equ 82                   ; the fixed .shstrtab blob below
 SYM_CAP_MASK    equ 262143
 SEC_TEXT        equ 0
 SEC_DATA        equ 1
@@ -1183,13 +1189,19 @@ pop rdi
 mov rax, [r10+48]
 cmp rax, SYMB_GLOBAL
 je oes_global
-mov rax, STB_LOCAL_INFO
+mov r9, STB_LOCAL_INFO
 jmp oes_info
 oes_global:
-mov rax, STB_GLOBAL_INFO
+mov r9, STB_GLOBAL_INFO
 oes_info:
-movb [rdi+4], rax
 
+; st_info is bind<<4 | type, and the type is inferred from the section
+; the symbol lives in: a name in .text is code, a name in .data or .bss
+; is data. It was STT_NOTYPE for everything, which tells objdump and gdb
+; nothing about where a function starts. st_size stays 0 -- the extent of
+; a symbol is genuinely unknown here without a `.size` directive to state
+; it, and guessing it from the distance to the next label would be wrong
+; for any label that is not a function start.
 mov rax, [r10+32]                  ; status
 cmp rax, SYM_EXTERN
 je oes_undef
@@ -1200,18 +1212,22 @@ je oes_text
 cmp rax, SEC_BSS
 je oes_bss
 mov rax, SEC_IDX_DATA
+add r9, STT_OBJECT
 jmp oes_have
 oes_bss:
 mov rax, SEC_IDX_BSS
+add r9, STT_OBJECT
 jmp oes_have
 oes_text:
 sub rdx, HDR_LEN                   ; .text values are stored relative to the
 mov rax, SEC_IDX_TEXT              ; executable header area an object lacks
+add r9, STT_FUNC
 jmp oes_have
 oes_undef:
-mov rax, SHN_UNDEF
-mov rdx, 0
+mov rax, SHN_UNDEF                 ; an undefined symbol has no section to
+mov rdx, 0                         ; infer a type from, so it stays NOTYPE
 oes_have:
+movb [rdi+4], r9                   ; st_info
 movb [rdi+6], rax
 shr rax, 8
 movb [rdi+7], rax
@@ -1594,6 +1610,27 @@ mov rsi, SHSTR_LEN
 call obj_put_shdr
 mov rax, 1
 mov [rdi+48], rax
+
+; --- 9: .note.GNU-stack. Empty, and its emptiness is the entire point:
+; a linker that finds no such section has to assume the object might
+; want an executable stack, and marks the whole program that way. Every
+; other assembler emits it; this one did not, so anything linked from
+; these objects got an executable stack by implication. ---
+mov rdi, rbx
+add rdi, OBJ_SHDR_OFF
+mov rax, SHDR_ENT
+mov rcx, SEC_IDX_NOTE
+imul rax, rcx
+add rdi, rax
+mov rax, 66
+mov rcx, SHT_PROGBITS
+mov rdx, rbx
+add rdx, OBJ_OFF_SHSTR
+mov rdx, [rdx+0]
+mov rsi, 0
+call obj_put_shdr
+mov rax, 1
+mov [rdi+48], rax
 ret
 
 ; obj_rela_links -- rdi = &shdr of a .rela section, rcx = the section it
@@ -1861,6 +1898,23 @@ obj_put_ret:
 ret
 
 build_output:
+; A flat executable with no code is not a program. Empty input, or input
+; that is only comments, used to produce a 288-byte ELF containing
+; nothing but its own headers: exit 0, mode 0755, and a segfault the
+; moment anyone ran it. Producing a plausible artifact for input that
+; describes no program is the same failure this file refuses everywhere
+; else, just at file scope instead of instruction scope. (An object with
+; an empty .text is a different matter -- a data-only translation unit is
+; legitimate and links fine -- so this is checked here and not in
+; emit_object.)
+mov rax, rbx
+add rax, SAVED_TEXT_R15_OFF
+mov rax, [rax+0]
+mov rcx, r14
+add rcx, HDR_LEN
+cmp rax, rcx
+jbe die_no_code
+
 mov rax, rbx
 add rax, SAVED_TEXT_R15_OFF
 mov rax, [rax+0]
@@ -2843,13 +2897,28 @@ mov rdx, [rdx+0]
 and r9, rdx
 jmp focs_probe
 focs_create:
+; The ceiling has to come from the mask this process is actually probing
+; with, not from the full table's SYM_POP_MAX. A worker narrows its mask
+; to a fraction of SYM_CAP (see par_spawn_child_go) while this compared
+; against the whole table's limit, so a worker could fill its own small
+; table completely and keep inserting -- and focs_probe, finding no empty
+; slot anywhere, then walked the ring forever. Every core pinned, no
+; output, no diagnostic, no end. 7/8 because open addressing degrades
+; badly above that, which is where SYM_POP_MAX came from too.
 mov r11, rbx
-add r11, SYMTAB_META_OFF        ; repurposed as a population counter --
-mov rax, [r11+0]                ; the hash table has no "count of live
-cmp rax, SYM_POP_MAX            ; entries scanned so far" to track otherwise
+add r11, SYMMASK_OFF
+mov r11, [r11+0]
+add r11, 1                      ; slots in THIS process's table
+mov rdx, r11
+shr rdx, 3
+sub r11, rdx                    ; 7/8 of them
+mov rdx, rbx
+add rdx, SYMTAB_META_OFF        ; repurposed as a population counter --
+mov rax, [rdx+0]                ; the hash table has no "count of live
+cmp rax, r11                    ; entries scanned so far" to track otherwise
 jae die_toomany_syms
 add rax, 1
-mov [r11+0], rax
+mov [rdx+0], rax
 mov [r10+0], r8
 mov [r10+8], rsi
 mov [r10+16], rcx
@@ -3641,6 +3710,11 @@ ret
 ;   of not calling it.
 par_assemble:
 call par_prescan
+mov rax, rbx                        ; the prescan can decide the file is
+add rax, PAR_GIVEUP_OFF             ; not splittable before any work is
+mov rax, [rax+0]                    ; forked out at all
+cmp rax, 0
+jne par_assemble_nofit
 call par_spawn
 cmp rax, 0
 jne par_assemble_nofit
@@ -3947,7 +4021,7 @@ mov rax, rbx
 add rax, PAR_CONST_META_OFF
 mov rdx, [rax+0]
 cmp rdx, PAR_CONST_CAP
-jae die_toomany_syms
+jae par_prescan_giveup
 mov r8, rdx
 shl r8, PAR_CONST_SHIFT            ; * PAR_CONST_ENT
 mov r9, rbx
@@ -3962,6 +4036,23 @@ pop r10
 pop r9
 pop r8
 jmp par_prescan_comment
+; More constants than the prescan array can carry. The serial path has no
+; such limit and assembles the file fine, so dying here would mean the
+; worker count decided whether a build works -- which is the one thing
+; this design is not allowed to do. It reported "too many symbols" (the
+; wrong limit) at "line 1 col 534853" (a raw byte offset, because the
+; line counter does not run during the prescan), which was three wrong
+; things in one message for a situation that is not an error at all.
+par_prescan_giveup:
+mov rax, rbx
+add rax, PAR_GIVEUP_OFF
+mov rcx, 1
+mov [rax+0], rcx
+pop r10
+pop r9
+pop r8
+jmp par_prescan_comment
+
 par_prescan_ident_done:
 pop rcx
 pop rdi
@@ -4141,11 +4232,25 @@ jae pscw_have
 shl rcx, 1
 jmp pscw_round
 pscw_have:
+; The 1/N argument above holds for labels and is false for constants:
+; par_install_consts replays EVERY equ into EVERY worker, so a file with
+; more constants than the narrowed table holds filled it before the
+; worker read a single line. Stop shrinking while there is still room for
+; four times the constant count -- an open-addressed table wants to stay
+; well under full, and this is the term the original reasoning missed.
+mov rax, rbx
+add rax, PAR_CONST_META_OFF
+mov rax, [rax+0]
+shl rax, 2
 mov rdx, SYM_CAP
 pscw_shift:
 cmp rcx, 1
 je pscw_masked
-shr rdx, 1
+mov rdi, rdx
+shr rdi, 1
+cmp rdi, rax
+jl pscw_masked
+mov rdx, rdi
 shr rcx, 1
 jmp pscw_shift
 pscw_masked:
@@ -5347,6 +5452,27 @@ mov rsi, 0x1FFFFFFFFFFFFFF        ; 2^57-1: sign bit and everything above
 cmp rcx, rsi
 je egi_imm8
 
+; rax has a one-byte opcode of its own for each of these -- 05 0D 25 2D
+; 35 3D, which is (digit << 3) + 5 -- saving the ModRM byte. It only
+; exists at imm32, so the imm8 path above cannot use it, and the
+; differential generator excluded rax from its imm32 loop precisely
+; because this was missing, which is what kept it missing.
+cmp rax, 0
+jne egi_general
+mov rcx, 0x48
+movb [r15+0], rcx
+mov rcx, r10
+shl rcx, 3
+add rcx, 5
+movb [r15+1], rcx
+mov rdi, r15
+add rdi, 2
+mov rax, r9
+call store_dword
+add r15, 6
+ret
+
+egi_general:
 mov rcx, 0x48
 mov rsi, rax
 shr rsi, 3
@@ -5477,6 +5603,8 @@ ret
 ;   out: r15 += 4
 ; ===========================================================================
 emit_shift_imm:
+cmp r11, 1                         ; D1 /digit is the shift-by-one form and
+je esi_by_one                      ; carries no immediate byte at all
 mov rcx, 0x48
 mov rsi, rax
 shr rsi, 3
@@ -5495,6 +5623,24 @@ movb [r15+2], rsi
 movb [r15+3], r11
 
 add r15, 4
+ret
+
+esi_by_one:
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+add rcx, rsi
+movb [r15+0], rcx
+mov rsi, 0xD1
+movb [r15+1], rsi
+mov rsi, rax
+and rsi, 7
+mov rdi, r10
+shl rdi, 3
+add rsi, rdi
+add rsi, 0xC0
+movb [r15+2], rsi
+add r15, 3
 ret
 
 ; ===========================================================================
@@ -6066,6 +6212,17 @@ push rax
 mov rax, r9
 call check_imm32                   ; only imm32 fits; wider must not truncate
 pop rax
+; 6B /r ib is the same instruction with a sign-extended byte, four bytes
+; against seven. The imm8 short form was implemented for the 81-group and
+; not for this one, which is the kind of gap that survives because the
+; generator excluded imul from its imm8 loop.
+mov rcx, r9
+shr rcx, 7
+cmp rcx, 0
+je eii_imm8
+mov rsi, 0x1FFFFFFFFFFFFFF
+cmp rcx, rsi
+je eii_imm8
 mov rcx, 0x48
 mov rsi, rax
 shr rsi, 3
@@ -6089,6 +6246,29 @@ add rdi, 3
 mov rax, r9
 call store_dword
 add r15, 7
+ret
+
+eii_imm8:
+mov rcx, 0x48
+mov rsi, rax
+shr rsi, 3
+shl rsi, 2                         ; REX.R
+add rcx, rsi
+mov rsi, rax
+shr rsi, 3                         ; REX.B
+add rcx, rsi
+movb [r15+0], rcx
+mov rcx, 0x6B
+movb [r15+1], rcx
+mov rsi, rax
+and rsi, 7
+mov rdi, rsi
+shl rsi, 3
+add rsi, rdi
+add rsi, 0xC0
+movb [r15+2], rsi
+movb [r15+3], r9
+add r15, 4
 ret
 
 ; ===========================================================================
@@ -6164,6 +6344,23 @@ push rax
 mov rax, r9
 call check_imm32
 pop rax
+; A9 id is `test rax, imm32` without a ModRM byte. Same shape as the
+; accumulator forms in emit_grp1_imm, and missing for the same reason:
+; the generator excluded rax from the loop that would have caught it.
+cmp rax, 0
+jne eg3_general
+mov rcx, 0x48
+movb [r15+0], rcx
+mov rcx, 0xA9
+movb [r15+1], rcx
+mov rdi, r15
+add rdi, 2
+mov rax, r9
+call store_dword
+add r15, 6
+ret
+
+eg3_general:
 mov rcx, 0x48
 mov rsi, rax
 shr rsi, 3                         ; REX.B: /digit is an opcode extension,
@@ -7294,6 +7491,9 @@ mov rdi, 1
 mov rax, SYS_exit
 syscall
 ; die_include_open -- rdi = the NUL-terminated path that would not open.
+die_no_code:
+mov rdi, msg_nocode
+jmp die
 die_include_open:
 push rdi
 mov rdi, msg_noinclude
@@ -7491,7 +7691,8 @@ ret
 ; .shstrtab for object output. Fixed content, so the sh_name of every
 ; section is a constant offset into it rather than something to compute:
 ; .text=1 .data=7 .bss=13 .symtab=18 .strtab=26 .rela.text=34
-; .rela.data=45 .shstrtab=56, and SHSTR_LEN=66 is the total.
+; .rela.data=45 .shstrtab=56 .note.GNU-stack=66, and SHSTR_LEN=82 is
+; the total.
 obj_shstr:
 db 0
 db ".text"
@@ -7509,6 +7710,8 @@ db 0
 db ".rela.data"
 db 0
 db ".shstrtab"
+db 0
+db ".note.GNU-stack"
 db 0
 
 msg_mmap:
@@ -7533,6 +7736,10 @@ db 10
 db 0
 msg_write:
 db "v1: write failed"
+db 10
+db 0
+msg_nocode:
+db "v1: no code in .text -- a flat executable needs an entry point"
 db 10
 db 0
 msg_noinclude:
@@ -7652,7 +7859,11 @@ db 1
 db 2
 db 0
 db 0
-db 0
+db 1                              ; CR: treated as whitespace, so a file
+                                   ; with CRLF line endings assembles. It
+                                   ; classified as nothing, which made every
+                                   ; line of a Windows-authored file end in
+                                   ; "bad operand"
 db 0
 db 0
 db 0

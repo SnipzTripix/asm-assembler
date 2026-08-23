@@ -51,9 +51,9 @@ errors "imm32 overflow"       'add rax, 0x123456789\nret\n'
 errors "imm64 overflow"       'mov rax, 99999999999999999999999\nret\n'
 
 # The boundaries themselves must still assemble -- an over-eager range
-# check is the same bug wearing the opposite sign. (add/sub go through
-# the general 81 /digit form -- this dialect has no accumulator-specific
-# short opcode, which is a size choice, not a correctness one.)
+# check is the same bug wearing the opposite sign. rax uses the
+# accumulator-specific opcodes (05 for add, 2D for sub), which is where
+# the shorter encodings below come from.
 # 0xFFFFFFFFFFFFFFFF is -1, so the sign-extended imm32 form sets exactly
 # the same bits in three fewer bytes. The value still has to survive
 # parsing at full width, which is what this is really testing.
@@ -64,7 +64,7 @@ emits  "imm64 that needs all 64 bits" \
        "48 b8 f0 de bc 9a 78 56 34 12 c3" \
        'mov rax, 0x123456789ABCDEF0\nret\n'
 emits  "imm32 boundaries" \
-       "48 81 c0 ff ff ff 7f 48 81 e8 00 00 00 80 c3" \
+       "48 05 ff ff ff 7f 48 2d 00 00 00 80 c3" \
        'add rax, 2147483647\nsub rax, -2147483648\nret\n'
 emits  "disp32 boundaries" \
        "48 8b 8b ff ff ff 7f 48 8b 93 00 00 00 80 c3" \

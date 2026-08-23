@@ -99,6 +99,20 @@ else
     echo "FAIL: missing include reported as [$(cat "$D/e")]"; fail=1
 fi
 
+echo "--- input describing no program is not a program ---"
+# These produced a 288-byte ELF of nothing but headers: exit 0, mode
+# 0755, and a segfault the instant anyone ran it.
+reject "empty input"             ''
+reject "comment-only input"      '; nothing here\n'
+reject "blank lines only"        '\n\n\n'
+reject "data but no code"        '.data\ndb 1\n'
+# An object with an empty .text is a different matter: a data-only
+# translation unit is legitimate and links fine.
+printf '.data\ndb 1\n' > "$D/t.v0"
+$V -f elf64 "$D/t.v0" "$D/t.o" 2>"$D/e" \
+    && echo "ok   -f elf64 still accepts a data-only object" \
+    || { echo "FAIL: data-only object rejected: $(cat "$D/e")"; fail=1; }
+
 echo "--- assembling a file over itself must not destroy it ---"
 # This exited 0 and produced a working binary, having overwritten the
 # source with it. Both spellings of the same file have to be caught, so

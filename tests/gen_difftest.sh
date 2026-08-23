@@ -37,6 +37,11 @@ v0="$D/gen.v0"; ref="$D/gen.s"
 
 emit() { echo "$1" >> "$v0"; echo "	$2" >> "$ref"; }
 
+# A negative offset is written [base-N], never [base+-N]: the dialect
+# takes one sign, and the reference accepting both is not a reason to
+# generate a form v1 is right to reject.
+signed() { case $1 in -*) printf '%s' "$1" ;; *) printf '+%s' "$1" ;; esac; }
+
 # --- ALU reg,reg over the full 16x16 cross product ---
 for op in add sub and or xor cmp test imul; do
     for d in $REGS; do for s in $REGS; do
@@ -44,14 +49,29 @@ for op in add sub and or xor cmp test imul; do
     done; done
 done
 
-# --- ALU reg,imm32 (values too wide for imm8; rax excluded where the
-#     reference would use the accumulator-specific opcode) ---
+# --- ALU reg,imm32, values too wide for imm8 ---
+# rax used to be skipped here "where the reference would use the
+# accumulator-specific opcode". That exclusion is why we never emitted
+# those opcodes: the one case that would have shown the difference was
+# the one case not being compared. rax is in the loop now.
 for op in add sub and or xor cmp test imul; do
     for d in $REGS; do
-        [ "$d" = "rax" ] && continue
         emit "$op $d, 123456" "$op $d, 123456"
         emit "$op $d, -654321" "$op $d, -654321"
     done
+done
+
+# --- forms whose short encodings were missing for the same reason ---
+# imul was excluded from the imm8 loop below, and a shift count of 1 has
+# its own opcode that nothing here ever asked for.
+for d in $REGS; do
+    for v in 0 1 5 127 -1 -128; do
+        emit "imul $d, $v" "imul $d, $v"
+    done
+    emit "shl $d, 1" "shl $d, 1"
+    emit "shr $d, 1" "shr $d, 1"
+    emit "shl $d, 2" "shl $d, 2"
+    emit "shr $d, 63" "shr $d, 63"
 done
 
 # --- ALU reg,imm8: the 83 /digit form, for every register including rax
@@ -68,7 +88,6 @@ done
 # imm32; rax excluded again, where the reference takes the short opcode.
 for op in add sub and or xor cmp; do
     for d in $REGS; do
-        [ "$d" = "rax" ] && continue
         emit "$op $d, 128" "$op $d, 128"
         emit "$op $d, -129" "$op $d, -129"
     done
@@ -93,6 +112,32 @@ for d in $REGS; do
     emit "mov $d, -2147483648"  "mov $d, -2147483648"
     emit "mov $d, 4294967296"   "movabs $d, 4294967296"
     emit "mov $d, -2147483649"  "movabs $d, -2147483649"
+done
+
+# --- scaled-index forms beyond the plain load ---
+# The cross product above only ever loads with an index. Stores, lea and
+# the sized moves take the same SIB path but were never compared through
+# it, which is untested rather than broken -- so test it.
+for x in rax rcx rbp rsp r12 r13; do
+    for sc in 1 2 4 8; do
+        [ "$x" = "rsp" ] && continue        # rsp cannot be an index
+        emit "mov [rbx+$x*$sc+64], rcx"  "mov [rbx+$x*$sc+64], rcx"
+        emit "lea rdx, [rbx+$x*$sc+64]"  "lea rdx, [rbx+$x*$sc+64]"
+        emit "movb rsi, [rbx+$x*$sc+64]" "movzx rsi, byte ptr [rbx+$x*$sc+64]"
+        emit "movw rsi, [rbx+$x*$sc+64]" "movzx rsi, word ptr [rbx+$x*$sc+64]"
+        emit "movd rsi, [rbx+$x*$sc+64]" "mov esi, dword ptr [rbx+$x*$sc+64]"
+        emit "movb [rbx+$x*$sc+64], r9"  "mov byte ptr [rbx+$x*$sc+64], r9b"
+        emit "movw [rbx+$x*$sc+64], r9"  "mov word ptr [rbx+$x*$sc+64], r9w"
+        emit "movd [rbx+$x*$sc+64], r9"  "mov dword ptr [rbx+$x*$sc+64], r9d"
+    done
+done
+# ...and with a base whose low bits are the SIB and disp escapes.
+for b in rsp rbp r12 r13; do
+    for d in 0 8 4096; do
+        o=$(signed "$d")
+        emit "mov [$b+rcx*4$o], rdx"  "mov [$b+rcx*4$o], rdx"
+        emit "lea rax, [$b+rcx*4$o]"  "lea rax, [$b+rcx*4$o]"
+    done
 done
 
 # --- Jcc rel32, every condition ---
@@ -149,10 +194,6 @@ done
 # on those two must still be encoded as a disp8 of zero. rsp and r12
 # force a SIB byte regardless. GNU as makes the same choices, so any
 # disagreement here is ours.
-# A negative offset is written [base-N], never [base+-N]: the dialect
-# takes one sign, and the reference accepting both is not a reason to
-# generate a form v1 is right to reject.
-signed() { case $1 in -*) printf '%s' "$1" ;; *) printf '+%s' "$1" ;; esac; }
 
 for b in $REGS; do
     for d in 0 1 127 128 -1 -128 -129 255 -32768; do

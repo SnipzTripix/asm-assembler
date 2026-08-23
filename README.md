@@ -188,9 +188,20 @@ machine rather than scaled:
 | `-j16` | 12 ms | 3.1 | **319 MB/s** |
 
 `-j16` is where the table stops because `MAX_JOBS` is 16 and the worker
-count is clamped to it, which on a 32-thread machine now leaves half the
-CPU unused. Reading `sched_getaffinity` and clamping to that instead is
-the obvious fix and is not done yet.
+count is clamped to it. An earlier version of this file called raising
+that clamp "the obvious fix" for the plateau. It isn't, and the numbers
+say so: measured on a 12.8 MB / 1M-statement input, `-j32` is identical
+to `-j16`, and the Amdahl split from the `-j8`/`-j16` pair is ~29 ms
+serial against ~37 ms parallel — **43% serial**, so the ceiling is 2.3×
+and the measurement is already 2.1× of it. Raising the clamp buys about
+a millisecond.
+
+The serial 29 ms is the pre-pass and the merge. That is what has to
+shrink, and most of the pre-pass does not actually need to be serial:
+chunk boundaries and section state can be found by a parallel scan, and
+only `equ` values genuinely flow forward through a file. Until that is
+done the worker count is not the limit and there is no point pretending
+otherwise.
 
 Files under 256 KB ignore the worker count and run serially — below that
 size, forking and merging cost more than they save. That threshold is
@@ -200,9 +211,10 @@ the serial path. `tests/par_equiv.sh` now reads the threshold out of the
 source, generates an input past it, and asserts that CPU time exceeds
 wall time — something a serial fallback cannot fake.
 
-The ceiling is Amdahl, not contention: a serial pre-pass has to run
-first (it finds chunk boundaries, and resolves the two things that
-genuinely flow forward through a file — the current section and the `equ`
+The ceiling is Amdahl, not contention, and it is measured rather than
+asserted: ~43% of the work is serial. A serial pre-pass has to run first
+(it finds chunk boundaries, and resolves the two things that genuinely
+flow forward through a file — the current section and the `equ`
 constants), and a serial merge has to stitch the pieces back together.
 Two optimisations do most of the work of keeping those cheap: workers
 resolve every reference that lands inside their own chunk (nearly all
