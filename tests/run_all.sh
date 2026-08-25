@@ -104,6 +104,9 @@ echo "=== symbol tables near their limits, at every worker count ==="
 echo "=== align ==="
 ./tests/safe.sh ./tests/check_align.sh "$V" || fail=1
 
+echo "=== a failing build says the same thing at every worker count ==="
+./tests/safe.sh ./tests/check_par_diag.sh "$V" || fail=1
+
 echo "=== .bss survives parallel assembly ==="
 ./tests/safe.sh ./tests/check_bss_par.sh "$V" || fail=1
 

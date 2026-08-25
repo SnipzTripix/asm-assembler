@@ -396,6 +396,17 @@ SM_BSSSZ        equ 40                   ; bytes this chunk reserved in .bss.
                                          ; worker's chunk was discarded and a
                                          ; file whose .bss was not in the
                                          ; final chunk lost its bss segment.
+SM_ERRMSG       equ 48                   ; the diagnostic this worker died
+                                         ; on: a pointer to its message, or
+                                         ; 0 for none. Safe across the fork
+                                         ; -- parent and workers are the
+                                         ; same non-PIE image at the same
+                                         ; load address, so the string sits
+                                         ; at the same address in all of
+                                         ; them. See par_record_err.
+SM_ERRLINE      equ 56                   ; line it happened on; 0 means the
+                                         ; message carries no position
+SM_ERRCOL       equ 64
 SM_NOFIT        equ 32                   ; 1 = this chunk did not fit its
                                          ; slot. Not an error: the parent
                                          ; throws every worker's output away
@@ -403,11 +414,18 @@ SM_NOFIT        equ 32                   ; 1 = this chunk did not fit its
                                          ; because asking for workers must
                                          ; never turn a build that works
                                          ; into one that does not.
-; A worker that dies writes its own diagnostic to fd 2, which it shares
-; with the parent, so the message reaches the user with a correct line
-; number and no marshalling is needed. Slots therefore carry no error
-; fields; two used to be declared here, pointing at a reporter that was
-; never written.
+; A worker that dies records its diagnostic in its slot -- message,
+; line, column -- and exits 0; the parent reports exactly one of them
+; once every worker is reaped. This used to say that sharing fd 2 with
+; the parent meant no marshalling was needed. Marshalling was exactly
+; what was needed: each diagnostic is six write(2) calls, so messages
+; from different workers interleaved mid-word, and a file with an error
+; in every chunk printed one line per chunk instead of one per file.
+; 39 runs in 60 came out garbled, and some of the garbage still parsed
+; -- two workers' digits ran together into a column number that looked
+; perfectly valid. Which error you were shown became a scheduling race,
+; on a project whose headline property is that -j never changes the
+; result. See par_record_err and par_spawn_err_loop.
 
 
 SSYM_ENT        equ 64                   ; {name_ptr, name_len, value, section,
@@ -779,6 +797,15 @@ cmp rax, MMAP_ERR_THRESH            ; think it should fork, which is a
 jae die_mmap                        ; fork bomb, not a bug you debug twice
 mov rbx, rax
 
+; Set before anything that can fail: every die past this point asks
+; whether it is running inside a worker, and reading that answer needs
+; the arena, which only exists from the line above. It used to be set
+; after check_not_same_file, which is already far enough in to matter.
+mov rax, rbx
+add rax, MYJOB_OFF                  ; the parent is not a worker; workers
+mov rcx, NEG_ONE                    ; overwrite this with their index
+mov [rax+0], rcx
+
 mov rax, rbx
 add rax, INPUT_FD_OFF
 mov [rax+0], r13
@@ -796,11 +823,6 @@ mov rax, rbx
 add rax, OUTFMT_OFF
 mov [rax+0], r9
 call check_not_same_file
-
-mov rax, rbx
-add rax, MYJOB_OFF                  ; the parent is not a worker; workers
-mov rcx, NEG_ONE                    ; overwrite this with their index
-mov [rax+0], rcx
 
 ; --- MAP_SHARED result area, only when actually running parallel ---
 ; The count is re-read from JOBS_OFF rather than trusted in r11. It was
@@ -4451,13 +4473,59 @@ par_spawn_nofit:
 mov rax, 1
 ret
 par_spawn_all_fit:
+; Every chunk fit. Did any worker die on a diagnostic? They record
+; rather than print (par_record_err), so exactly one message comes out
+; and it is the one the serial path would have given: chunks partition
+; the file in order, so the first slot carrying an error holds the
+; lowest line number.
+;
+; This runs after the NOFIT scan on purpose. A chunk that outgrew its
+; slot stopped early and may never have reached its own error, so
+; reporting some later chunk's error would name a different line than
+; serial. NOFIT wins, the file is reassembled serially, and the serial
+; path finds the true first error itself.
+mov rax, rbx
+add rax, JOBS_OFF
+mov r8, [rax+0]
+mov r9, 0
+par_spawn_err_loop:
+cmp r9, r8
+jae par_spawn_clean
+mov rax, r9
+shl rax, SLOT_SHIFT
+mov rcx, rbx
+add rcx, SHARED_OFF
+mov rcx, [rcx+0]
+add rax, rcx
+mov rcx, rax
+add rcx, SM_ERRMSG
+mov rdi, [rcx+0]
+cmp rdi, 0
+jne par_spawn_report
+add r9, 1
+jmp par_spawn_err_loop
+
+par_spawn_report:
+mov rcx, rax
+add rcx, SM_ERRLINE
+mov rsi, [rcx+0]
+mov rcx, rax
+add rcx, SM_ERRCOL
+mov rdx, [rcx+0]
+cmp rsi, 0
+je die_raw                          ; a message that carries no position
+jmp die_at_pos
+
+par_spawn_clean:
 mov rax, 0
 ret
 
+; A worker that exits non-zero now means a real crash: a diagnostic
+; leaves through par_record_err and exits 0. Saying so beats the silent
+; exit 1 this used to be.
 par_worker_failed:
-mov rdi, 1
-mov rax, SYS_exit
-syscall
+mov rdi, msg_workercrash
+jmp die_raw
 
 ; ===========================================================================
 ; par_worker_emit -- a worker has finished assembling its chunk; hand the
@@ -7791,10 +7859,10 @@ ret
 ; ===========================================================================
 die_mmap:
 mov rdi, msg_mmap
-jmp die
+jmp die_raw
 die_open:
 mov rdi, msg_open
-jmp die
+jmp die_raw
 die_fork:
 mov rdi, msg_fork
 jmp die
@@ -7818,13 +7886,13 @@ mov rdi, msg_externflat
 jmp die_at_line
 die_bad_jobs:
 mov rdi, msg_badjobs
-jmp die
+jmp die_raw
 die_bad_flag:
 mov rdi, msg_badflag
-jmp die
+jmp die_raw
 die_bad_format:
 mov rdi, msg_badformat
-jmp die
+jmp die_raw
 die_bad_hex:
 mov rdi, msg_badhex
 jmp die_at_line
@@ -7984,7 +8052,18 @@ ret
 
 ; die -- rdi = NUL-terminated message (already has its own trailing
 ; newline). For I/O-level failures (mmap/read/write), no line number.
+; die -- rdi = message, no source position. Workers record instead of
+; printing; see par_record_err.
 die:
+mov rsi, 0                          ; no line
+mov rdx, 0
+call par_record_err                 ; returns only in the parent
+
+; die_raw -- print rdi and exit 1, asking nobody anything. The startup
+; errors use this directly: they all fire before the arena is mapped,
+; so the worker check cannot read its answer, and before any fork, so
+; there is nothing to ask.
+die_raw:
 call write_cstr_fd2
 mov rdi, 1
 mov rax, SYS_exit
@@ -7993,30 +8072,93 @@ syscall
 ; die_at_line -- rdi = NUL-terminated message (NO trailing newline).
 ; Appends " at line N\n" using the running line counter, then exits 1.
 die_at_line:
-call write_cstr_fd2
-mov rdi, msg_atline
-call write_cstr_fd2
+push rdi
 mov rax, rbx
 add rax, LINE_OFF
-mov rax, [rax+0]
-call print_udec
+mov rsi, [rax+0]
 ; column, so the message points at the offending token rather than just
 ; the line. The cursor has usually stopped exactly where parsing gave up.
-mov rdi, msg_atcol
-call write_cstr_fd2
 mov rax, rbx
 add rax, LINE_START_OFF
 mov rax, [rax+0]
-mov rcx, r13
-sub rcx, rax
-add rcx, 1                         ; columns read naturally from 1
-mov rax, rcx
+mov rdx, r13
+sub rdx, rax
+add rdx, 1                          ; columns read naturally from 1
+pop rdi
+call par_record_err                 ; returns only in the parent
+
+; die_at_pos -- rdi = message, rsi = line, rdx = column. Split out from
+; die_at_line so the parent can replay a worker's recorded diagnostic
+; through exactly this code. That is what makes the parallel message
+; identical to the serial one rather than merely similar.
+die_at_pos:
+push rsi
+push rdx
+call write_cstr_fd2
+mov rdi, msg_atline
+call write_cstr_fd2
+pop rdx
+pop rsi
+push rdx
+mov rax, rsi
+call print_udec
+mov rdi, msg_atcol
+call write_cstr_fd2
+pop rax
 call print_udec
 mov rdi, msg_nl
 call write_cstr_fd2
 mov rdi, 1
 mov rax, SYS_exit
 syscall
+
+; ===========================================================================
+; par_record_err -- rdi = message, rsi = line (0 = none), rdx = column.
+; In a worker: stores all three in this chunk's shared slot and exits 0,
+; so the parent can report one diagnostic for the whole file. In the
+; parent: returns, and the caller prints as it always did.
+;
+; Chunks partition the file in order, so the lowest-indexed slot carrying
+; an error holds the lowest line number -- the parent needs no comparison,
+; just the first hit. That is how the serial message is reproduced exactly.
+;   clob: rax, rcx
+; ===========================================================================
+par_record_err:
+push rdi
+push rsi
+push rdx
+mov rax, rbx
+add rax, MYJOB_OFF
+mov rax, [rax+0]
+cmp rax, NEG_ONE
+je par_record_err_parent
+shl rax, SLOT_SHIFT
+mov rcx, rbx
+add rcx, SHARED_OFF
+mov rcx, [rcx+0]
+add rax, rcx                        ; rax = this worker's slot
+pop rdx
+pop rsi
+pop rdi
+mov rcx, rax
+add rcx, SM_ERRLINE
+mov [rcx+0], rsi
+mov rcx, rax
+add rcx, SM_ERRCOL
+mov [rcx+0], rdx
+mov rcx, rax
+add rcx, SM_ERRMSG
+mov [rcx+0], rdi                    ; written last: the parent tests this
+                                    ; field, so line and column are already
+                                    ; in place when it turns non-zero
+mov rdi, 0                          ; exit 0 -- the parent must not read a
+mov rax, SYS_exit                   ; reported diagnostic as a crash
+syscall
+par_record_err_parent:
+pop rdx
+pop rsi
+pop rdi
+ret
 
 ; ===========================================================================
 ; print_udec -- rax = unsigned value; writes its decimal digits to fd 2.
@@ -8115,6 +8257,9 @@ db 0
 db ".note.GNU-stack"
 db 0
 
+msg_workercrash:
+db "v1: a parallel worker died unexpectedly"
+db 0
 msg_mmap:
 db "v1: mmap failed"
 db 10
