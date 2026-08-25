@@ -71,9 +71,11 @@ the dialect grows, so it's the source of truth, not this file. Briefly:
   label addresses), `lea`, `imul`, `neg`
 - `add sub and or xor cmp test` (reg,reg and reg,imm; immediates may be
   negative and are range-checked), `shl shr`
-- `push pop`, `call` (label *or* register), `ret`, `syscall`, `jmp`, and
-  `Jcc` in all sixteen conditions (`jo jno jb jae je jne jbe ja js jns jp
-  jnp jl jge jle jg` — canonical names only, no `jz`/`jc` aliases)
+- `push pop`, `ret`, `syscall`, `call` and `jmp` (each taking a label
+  *or* a register — the register form is the near indirect `FF /digit`),
+  and `Jcc` in all sixteen conditions (`jo jno jb jae je jne jbe ja js
+  jns jp jnp jl jge jle jg` — canonical names only, no `jz`/`jc`
+  aliases)
 - `db` with `\n \t \r \0 \\ \"` escapes, `dw`/`dd`/`dq` — and `dq label`,
   which together with `call reg` makes a function-pointer dispatch table
   expressible
@@ -82,11 +84,10 @@ the dialect grows, so it's the source of truth, not this file. Briefly:
   `resb`
 - memory operands `[base+disp]` and `[base+index*scale+disp]`
 - `.text`/`.data`/`.bss` — real ELF segments: R+X, RW, and a
-  zero-filled RW mapping that costs nothing in the file. `jmp reg`
-  is not supported, though `call reg` is. `.bss` takes only `resb`,
-  labels and `equ`: it contributes no file bytes, so a `db` or an
-  instruction there is an error rather than a byte that silently
-  disappears
+  zero-filled RW mapping that costs nothing in the file. `.bss` takes
+  only `resb`, labels and `equ`: it contributes no file bytes, so a
+  `db` or an instruction there is an error rather than a byte that
+  silently disappears
 - `%include "file"`, nesting supported
 - `global NAME` / `extern NAME` for object output
 - `[-f elf64]`, then filenames, then a worker count

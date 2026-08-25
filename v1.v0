@@ -42,7 +42,8 @@
 ;   add sub and or xor cmp test   reg,reg and reg,imm; immediates may be
 ;            negative and are range-checked, never truncated
 ;   shl shr  imm8 or constant, unsigned
-;   push pop, ret, syscall, call (label or register), jmp, and Jcc in
+;   push pop, ret, syscall, call and jmp (each label or register -- the
+;            register form is the near indirect FF /digit), and Jcc in
 ;            all sixteen conditions: jo jno jb jae je jne jbe ja js jns
 ;            jp jnp jl jge jle jg (canonical names only, no jz/jc aliases)
 ;   db       string with \n \t \r \0 \\ \" escapes, or a single byte
@@ -6709,12 +6710,26 @@ ret
 ; ===========================================================================
 ; jmp/call/je/jne/jl/jae label -- opcode(s) then a rel32 label reference
 ; ===========================================================================
+; jmp takes either a label (E9 rel32) or a register (FF /4), the same
+; near-indirect form as `call reg` with a different opcode extension.
+; Without the register form this fell straight through to the label
+; path and reported `undefined label: rax`, sending the reader to look
+; for a missing label instead of at the operand.
 do_jmp:
 call skip_ws
+call parse_reg
+cmp rax, NEG_ONE
+jne do_jmp_indirect
 mov rax, 0xE9
 movb [r15+0], rax
 add r15, 1
 call emit_rel32_ref
+call expect_eol
+ret
+
+do_jmp_indirect:
+mov r10, 0xE0                      ; mod=11 (0xC0) | digit 4 (0x20)
+call emit_ff_reg
 call expect_eol
 ret
 
@@ -6732,29 +6747,37 @@ mov rax, 0xE8
 movb [r15+0], rax
 add r15, 1
 call emit_rel32_ref
-jmp do_call_tail
+call expect_eol
+ret
 
 do_call_indirect:
-; FF /2, mod=11: no REX.W -- a near call defaults to 64-bit operand size
-; in long mode -- but REX.B is needed to reach r8..r15
+mov r10, 0xD0                      ; mod=11 (0xC0) | digit 2 (0x10)
+call emit_ff_reg
+call expect_eol
+ret
+
+; ===========================================================================
+; emit_ff_reg -- FF /digit with mod=11: a near indirect jmp or call through
+; an address held in a register. No REX.W -- both default to 64-bit operand
+; size in long mode -- but REX.B is needed to reach r8..r15.
+;   in: rax = register number, r10 = ModRM byte with rm still zero
+; ===========================================================================
+emit_ff_reg:
 mov rcx, rax
 shr rcx, 3
 cmp rcx, 0
-je do_call_norex
+je emit_ff_reg_norex
 mov rdx, 0x41                      ; REX.B
 movb [r15+0], rdx
 add r15, 1
-do_call_norex:
+emit_ff_reg_norex:
 mov rdx, 0xFF
 movb [r15+0], rdx
 mov rdx, rax
 and rdx, 7
-add rdx, 0xD0                      ; mod=11 (0xC0) | digit 2 (0x10) | rm
+add rdx, r10
 movb [r15+1], rdx
 add r15, 2
-
-do_call_tail:
-call expect_eol
 ret
 
 ; ===========================================================================
@@ -6980,13 +7003,20 @@ do_db_string:
 ; what the test programs did, and why their output read "hello, seed\n".
 ; An unrecognised escape is an error rather than a silently-kept
 ; backslash: guessing is how "\d" quietly becomes two bytes nobody meant.
+; The scan below used to run to the end of the whole input, so an
+; unterminated literal reported a column past the end of its own line
+; -- col 12 on a 10-character line. It stops at the newline now, and
+; r10 keeps the opening quote so the message points at it.
+mov r10, r13
 add r13, 1
 do_db_copy:
 cmp r13, r12
-jae die_unterminated
+jae die_unterminated_str
 movb rax, [r13+0]
 cmp rax, CH_QUOTE
 je do_db_close
+cmp rax, CH_NL
+je die_unterminated_str
 cmp rax, CH_BACKSLASH
 je do_db_escape
 movb [r15+0], rax
@@ -6997,7 +7027,7 @@ jmp do_db_copy
 do_db_escape:
 add r13, 1
 cmp r13, r12
-jae die_unterminated
+jae die_unterminated_str
 movb rax, [r13+0]
 cmp rax, CH_n
 je do_db_esc_nl
@@ -7767,6 +7797,8 @@ jmp die_at_line
 die_bad_escape:
 mov rdi, msg_badescape
 jmp die_at_line
+die_unterminated_str:
+mov r13, r10                       ; point at the quote that opened it
 die_unterminated:
 mov rdi, msg_unterminated
 jmp die_at_line

@@ -212,6 +212,16 @@ for b in $REGS; do
     done
 done
 
+# --- near indirect jmp/call (FF /4, FF /2) ---
+# jmp reg had no encoder at all: it fell through to the label path and
+# reported `undefined label: rax`. rsp and rbp are the interesting ones
+# -- FF /digit with mod=11 has no SIB or displacement trap, so they
+# encode like any other register, and the cross product proves it.
+for b in $REGS; do
+    emit "jmp $b"  "jmp $b"
+    emit "call $b" "call $b"
+done
+
 echo "generated $(wc -l < "$v0") instructions"
 
 $V "$v0" "$D/v1.bin" 2>"$D/v1.err" || { echo "v1 FAILED: $(head -2 "$D/v1.err")"; exit 1; }

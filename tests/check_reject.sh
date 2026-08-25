@@ -155,6 +155,17 @@ for tail in 'dq buf\n' 'dq buf'; do
     esac
 done
 
+echo "--- diagnostics point at the right thing ---"
+# The string scan ran to the end of the input rather than the end of the
+# line, so an unterminated literal reported a column past its own line.
+printf '.data\ns: db "abc\nmov rax, 60\n' > "$D/t.v0"
+$V "$D/t.v0" "$D/t.bin" 2>"$D/e"
+case "$(cat "$D/e")" in
+    *"line 2 col 7"*) echo "ok   unterminated string points at the quote" ;;
+    *) echo "FAIL unterminated string: $(cat "$D/e") -- wanted line 2 col 7"
+       fail=1 ;;
+esac
+
 echo "--- still accepted: these are valid and must keep working ---"
 value  "comment after statement" 7 'mov rdi, 7   ; trailing comment\nmov rax, 60\nsyscall\n'
 value  "tabs and spaces"         9 '\tmov  rdi,\t9\n\tmov rax, 60\n\tsyscall\n'
@@ -163,5 +174,6 @@ value  "max shift count"         0 'mov rax, 1\nshl rax, 63\nmov rdi, 0\nmov rax
 value  "negative equ"            5 'M equ -1\nmov rdi, 4\nsub rdi, M\nmov rax, 60\nsyscall\n'
 value  "db accepts both signs"   0 'mov rdi, 0\nmov rax, 60\nsyscall\ndb -1\ndb 0xFF\n'
 value  "resb+labels+equ in .bss" 8 '.bss\nbuf: resb 8\nN equ 8\n.text\nmov rdi, N\nmov rax, 60\nsyscall\n'
+value  "jmp reg reaches its target" 3 'mov rax, TGT\njmp rax\nmov rdi, 1\nmov rax, 60\nsyscall\nTGT:\nmov rdi, 3\nmov rax, 60\nsyscall\n'
 
 exit $fail
