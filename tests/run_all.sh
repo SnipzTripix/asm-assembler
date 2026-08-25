@@ -30,6 +30,29 @@ run_prog() {
     rm -f "/tmp/rt_$name" "/tmp/rt_$name.err"
 }
 
+# A test that cannot run is not a test that passed. These scripts are
+# authored on a filesystem with no executable bit (git's core.filemode is
+# false there), so the mode is carried by the index and a plain `chmod +x`
+# does not reach the commit. Three scripts reached CI as mode 100644;
+# `timeout` printed "Permission denied" on one line each and the suite
+# scrolled straight past them. This is a precondition, not a test case, so
+# it stops the run rather than logging a failure among the others.
+#
+# The index is what is checked, not the working tree: under WSL every file
+# on a Windows mount reads 0777, so a filesystem check is blind on exactly
+# the machine that introduces the problem.
+if command -v git >/dev/null 2>&1 && [ -d .git ]; then
+    noexec=$(git ls-files -s tests/*.sh bootstrap.sh | grep -v '^100755' | cut -f2)
+else
+    noexec=$(find tests -maxdepth 1 -name '*.sh' ! -perm -u+x)
+fi
+if [ -n "$noexec" ]; then
+    echo "FAIL: not executable, so these would be skipped rather than run:"
+    echo "$noexec" | sed 's/^/       /'
+    echo "  fix: git update-index --chmod=+x <file>"
+    exit 1
+fi
+
 # First, and on its own: the invocation everything below depends on.
 # Every other test here runs `$V file.v0 file.out`, so when that shape
 # broke, the failure arrived as dozens of unrelated-looking FAILs with no
