@@ -60,11 +60,22 @@
 ;            so `B equ A` aliases. May be referenced before its
 ;            definition by `mov reg, NAME`, but not by an arithmetic
 ;            operand, which resolves constants immediately
-;   labels, and memory operands [base+disp] and [base+index*scale+disp]
+;   labels    a name starting with a letter or underscore; the class
+;            table has said so since it was written, and until
+;            scan_ident read CLS_ISTART nothing enforced it
+;   memory operands [base], [base+disp] and [base+index*scale+disp],
+;            where the displacement may be a number or the name of an
+;            equ constant. It went through parse_imm, which reads
+;            digits and nothing else, so [rbx+LINE_OFF] was a syntax
+;            error and the source spelled it out in three instructions
 ;   .text .data .bss   choose which buffer statements append to; .text is
 ;            the default, so source that mentions none of them behaves
 ;            exactly as it did before sections existed
-;   %include "file"    spliced in textually before parsing; nests
+;   %include "file"    spliced in textually before parsing; nests. A
+;            relative name resolves against the directory of the
+;            top-level input file first, then as written -- see
+;            include_open for why it is that directory and not the
+;            including file's
 ;   global NAME        export the symbol from an object; ignored when the
 ;            output is a flat executable, which has nowhere to record it
 ;   extern NAME        the symbol is defined in some other object, so a
@@ -271,6 +282,12 @@ DEFLIST_OFF     equ 0xD900000            ; 8 MiB of symbol-slot pointers, one
 PAR_GIVEUP_OFF  equ 0xD800518            ; set when the prescan finds the file
                                           ; cannot be split; the parent then
                                           ; assembles it serially
+INPATH_OFF      equ 0xD800520            ; argv[1] as written, or 0 for stdin.
+                                          ; Kept so %include can be resolved
+                                          ; against the directory the input
+                                          ; file actually lives in
+INCPATH_OFF     equ 0xD800800            ; that directory joined to an
+INCPATH_CAP     equ 4096                 ; include name, built here
 LINE_START_OFF  equ 0xD800510            ; first byte of the current line,
                                           ; It sat at 0xE21FFF0, inside the
                                           ; last entry of the prescan constant
@@ -540,6 +557,7 @@ CH_NL           equ 10
 CH_SPACE        equ 32
 CH_QUOTE        equ 34
 CH_DOT          equ 46
+CH_SLASH        equ 47
 CH_PLUS         equ 43
 CH_COMMA        equ 44
 CH_MINUS        equ 45
@@ -665,6 +683,7 @@ start:
 ; assigned until after mmap below, well after these fds are stashed into
 ; memory.
 mov r13, 0                          ; input_fd, default stdin
+mov r12, 0                          ; input path, 0 until argv[1] is seen
 mov r14, 1                          ; output_fd, default stdout
 mov r9, 0                           ; output format: 0 = flat executable
 mov r10, 16                         ; byte offset of the input filename in
@@ -708,6 +727,8 @@ jl start_check_output
 mov rdi, rsp
 add rdi, r10
 mov rdi, [rdi+0]                    ; input filename
+mov r12, rdi                        ; kept for %include resolution; r12's
+                                    ; permanent role starts after mmap
 mov rsi, O_RDONLY
 push r9                             ; open clobbers rcx and r11, and the
 push r10                            ; format/offset pair has to survive it
@@ -805,6 +826,9 @@ mov rax, rbx
 add rax, MYJOB_OFF                  ; the parent is not a worker; workers
 mov rcx, NEG_ONE                    ; overwrite this with their index
 mov [rax+0], rcx
+mov rax, rbx
+add rax, INPATH_OFF
+mov [rax+0], r12
 
 mov rax, rbx
 add rax, INPUT_FD_OFF
@@ -2449,6 +2473,23 @@ mov rdx, class_tbl                  ; used to be saved and restored around
                                     ; is the same promise. Holding the table
                                     ; base here also stops the loop
                                     ; reloading the address each iteration.
+
+; The first character has a class of its own. CLS_ISTART is set for
+; letters and underscore and clear for digits, and has been since the
+; table was written -- nothing ever read it, which is why `1abc:` was a
+; legal label. A constant that is declared and never used means the
+; table and the code have drifted apart, which this project has already
+; paid for once.
+cmp r13, r12
+jae scan_ident_done
+movb rax, [r13+0]
+add rax, rdx
+movb rax, [rax+0]
+and rax, CLS_ISTART
+cmp rax, 0
+je scan_ident_done                  ; length 0; the caller names the
+add r13, 1                          ; problem, since what a bad first
+                                    ; byte means depends on where it is
 scan_ident_loop:
 cmp r13, r12
 jae scan_ident_done
@@ -3580,11 +3621,108 @@ ret
 ; r11 and the return address in rcx, so nothing may ride through a
 ; syscall in either. (The caller saves r9 across this call; r8, which
 ; holds the expansion counter, is left alone here.)
+; ===========================================================================
+; include_open -- rdi = the name exactly as written in the directive.
+; out: rax = fd, or negative if neither candidate opened.
+;
+; %include used to resolve only against the working directory, so a file
+; in src/ that includes a sibling built when you ran from src/ and failed
+; from the repo root. The name is now tried against the directory of the
+; top-level input file first, then exactly as written.
+;
+; That directory, and not the including file's, on purpose: the splice is
+; textual and happens before anything parses, so by the time a nested
+; include is reached the file it came from no longer exists as a thing to
+; ask about. One rule, no -I flag, and it covers the case that bites.
+;   clob: rax, rcx, rdx, rsi, rdi, r9, r10, r11
+; ===========================================================================
+include_open:
+movb rax, [rdi+0]
+cmp rax, CH_SLASH
+je include_open_asgiven            ; absolute: there is nothing to join
+mov rax, rbx
+add rax, INPATH_OFF
+mov rax, [rax+0]
+cmp rax, 0
+je include_open_asgiven            ; reading stdin: no directory to be in
+push rdi                           ; the name, needed after the prefix
+mov rsi, rax                       ; the input path
+
+; rdx = length of the directory prefix, counting its trailing '/'.
+; Zero when the input path has no '/' at all, which is the common case
+; and the one where joining would change nothing.
+mov rdx, 0
+mov rcx, 0
+include_open_scan:
+mov r9, rsi
+add r9, rcx
+movb rax, [r9+0]
+cmp rax, 0
+je include_open_scanned
+add rcx, 1
+cmp rax, CH_SLASH
+jne include_open_scan
+mov rdx, rcx
+jmp include_open_scan
+include_open_scanned:
+cmp rdx, 0
+je include_open_pop_asgiven
+
+mov rdi, rbx
+add rdi, INCPATH_OFF
+mov rcx, 0
+include_open_copydir:
+cmp rcx, rdx
+jae include_open_copyname
+mov r9, rsi
+add r9, rcx
+movb rax, [r9+0]
+mov r9, rdi
+add r9, rcx
+movb [r9+0], rax
+add rcx, 1
+jmp include_open_copydir
+
+include_open_copyname:
+pop rsi                            ; the name; put straight back, the
+push rsi                           ; fallback still needs it
+mov r10, 0
+include_open_copyn:
+cmp rcx, INCPATH_CAP
+jae include_open_pop_asgiven       ; joined path too long -- fall back
+mov r9, rsi                        ; rather than truncate into a name
+add r9, r10                        ; that means something else
+movb rax, [r9+0]
+mov r9, rdi
+add r9, rcx
+movb [r9+0], rax
+cmp rax, 0
+je include_open_joined             ; the NUL is copied too
+add rcx, 1
+add r10, 1
+jmp include_open_copyn
+
+include_open_joined:
+mov rsi, O_RDONLY
+mov rax, SYS_open
+syscall                            ; rdi is still the joined path
+cmp rax, 0
+jl include_open_pop_asgiven
+pop rdi                            ; balance the push; the fd is in rax
+ret
+include_open_pop_asgiven:
+pop rdi
+include_open_asgiven:
+mov rsi, O_RDONLY
+mov rax, SYS_open
+syscall
+ret
+
 read_include:
 push rdi                           ; the path, kept so a failure can name
-mov rsi, O_RDONLY                  ; it: "could not open input or output
-mov rax, SYS_open                  ; file" is the argv-level message and
-syscall                            ; says nothing about which include is
+call include_open                  ; it: "could not open input or output
+                                   ; file" is the argv-level message and
+                                   ; says nothing about which include is
 pop rdi                            ; missing, which is the only thing the
 cmp rax, 0                         ; reader needs to know
 jl die_include_open
@@ -5926,6 +6064,14 @@ push rax                         ; base
 cmp r13, r12
 jae die_bad_operand
 movb rcx, [r13+0]
+cmp rcx, CH_RBRACKET
+je parse_mem_zero_disp             ; [rbx] is [rbx+0]. Requiring the +0
+                                   ; made every memory operand in this
+                                   ; dialect spell out a displacement no
+                                   ; other assembler asks for, and the
+                                   ; README described `[rbx]` as the
+                                   ; three-byte form while the parser
+                                   ; refused it.
 cmp rcx, CH_PLUS
 je parse_mem_plus
 cmp rcx, CH_MINUS
@@ -5986,22 +6132,22 @@ mov rax, 0
 jmp parse_mem_haveimm
 parse_mem_idx_pos:
 add r13, 1
-call parse_imm
+call resolve_imm_operand
 jmp parse_mem_haveimm
 parse_mem_idx_neg:
 add r13, 1
-call parse_imm
+call resolve_imm_operand
 mov rdx, 0
 sub rdx, rax
 mov rax, rdx
 jmp parse_mem_haveimm
 
 parse_mem_disp_pos:
-call parse_imm
+call resolve_imm_operand
 jmp parse_mem_haveimm
 parse_mem_neg:
 add r13, 1
-call parse_imm
+call resolve_imm_operand
 mov rdx, 0
 sub rdx, rax
 mov rax, rdx
@@ -7269,7 +7415,7 @@ jmp die_unknown_mnem
 parse_stmt_ident:
 call scan_ident
 cmp rcx, 0
-je die_unknown_mnem
+je die_bad_stmt_start
 mov r10, rsi
 mov r11, rcx
 
@@ -7875,6 +8021,9 @@ jmp die
 die_write:
 mov rdi, msg_write
 jmp die
+die_bad_stmt_start:
+mov rdi, msg_stmtstart
+jmp die_at_line
 die_unknown_mnem:
 mov rdi, msg_unknown
 jmp die_at_line
@@ -8322,6 +8471,9 @@ db 10
 db 0
 msg_badhex:
 db "v1: hex literal has no digits"
+db 0
+msg_stmtstart:
+db "v1: not a mnemonic, a label or a directive"
 db 0
 msg_unknown:
 db "v1: unknown mnemonic"

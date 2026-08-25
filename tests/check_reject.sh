@@ -166,6 +166,16 @@ case "$(cat "$D/e")" in
        fail=1 ;;
 esac
 
+echo "--- a statement has to start with something that can start one ---"
+# CLS_ISTART has been in the class table since it was written, set for
+# letters and underscore and clear for digits, and nothing ever read it.
+# So `1abc:` was a legal label. A constant declared and never used means
+# the table and the code have drifted apart.
+reject "label starting with a digit" '1abc:\nmov rax, 60\nsyscall\n'
+reject "digit-led bare statement"    '9\nmov rax, 60\nsyscall\n'
+reject "punctuation at statement start" '@foo\nmov rax, 60\nsyscall\n'
+reject "undefined name as displacement" 'mov rax, [rbx+NOPE]\nmov rax, 60\nsyscall\n'
+
 echo "--- still accepted: these are valid and must keep working ---"
 value  "comment after statement" 7 'mov rdi, 7   ; trailing comment\nmov rax, 60\nsyscall\n'
 value  "tabs and spaces"         9 '\tmov  rdi,\t9\n\tmov rax, 60\n\tsyscall\n'
@@ -175,5 +185,10 @@ value  "negative equ"            5 'M equ -1\nmov rdi, 4\nsub rdi, M\nmov rax, 6
 value  "db accepts both signs"   0 'mov rdi, 0\nmov rax, 60\nsyscall\ndb -1\ndb 0xFF\n'
 value  "resb+labels+equ in .bss" 8 '.bss\nbuf: resb 8\nN equ 8\n.text\nmov rdi, N\nmov rax, 60\nsyscall\n'
 value  "jmp reg reaches its target" 3 'mov rax, TGT\njmp rax\nmov rdi, 1\nmov rax, 60\nsyscall\nTGT:\nmov rdi, 3\nmov rax, 60\nsyscall\n'
+value  "bare [reg]"               21 'mov rax, v\nmov rdi, [rax]\nmov rax, 60\nsyscall\n.data\nv: dq 21\n'
+value  "store through bare [reg]"   22 'mov rax, v\nmov rcx, 22\nmov [rax], rcx\nmov rdi, [rax]\nmov rax, 60\nsyscall\n.data\nv: dq 0\n'
+value  "named const displacement"   23 'N equ 8\nmov rax, v\nmov rdi, [rax+N]\nmov rax, 60\nsyscall\n.data\nv: dq 0\ndq 23\n'
+value  "negative named displacement" 24 'N equ 8\nmov rax, v\nadd rax, 8\nmov rdi, [rax-N]\nmov rax, 60\nsyscall\n.data\nv: dq 24\n'
+value  "named disp with scaled index" 25 'N equ 8\nmov rax, v\nmov rcx, 1\nmov rdi, [rax+rcx*8+N]\nmov rax, 60\nsyscall\n.data\nv: dq 0\ndq 0\ndq 25\n'
 
 exit $fail

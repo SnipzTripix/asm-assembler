@@ -59,4 +59,43 @@ $V "$D/self.v0" "$D/out.bin" 2>"$D/err"
 [ $? -ne 0 ] && echo "ok   self-include rejected: $(cat "$D/err")" \
              || { echo "FAIL self-include accepted"; fail=1; }
 
+
+echo "--- include search path ---"
+# %include used to resolve only against the working directory, so a file in
+# src/ that includes a sibling built from src/ and failed from the repo
+# root. The name is tried against the directory of the top-level input file
+# first, then exactly as written.
+P=$(mktemp -d); trap 'rm -rf "$D" "$P"' EXIT
+mkdir -p "$P/src/deep"
+printf 'mov rdi, 31\n'                       > "$P/src/util.v0"
+printf 'mov rdi, 32\n'                       > "$P/src/deep/inner.v0"
+printf '%%include "util.v0"\nmov rax, 60\nsyscall\n'       > "$P/src/main.v0"
+printf '%%include "src/util.v0"\nmov rax, 60\nsyscall\n'   > "$P/root.v0"
+printf '%%include "deep/inner.v0"\nmov rax, 60\nsyscall\n' > "$P/src/nest.v0"
+printf '%%include "nothere.v0"\nmov rax, 60\nsyscall\n'    > "$P/src/bad.v0"
+AV=$(cd "$(dirname "$V")" && pwd)/$(basename "$V")
+
+inc() { # inc <name> <cwd> <input> <wanted-exit>
+    if ! ( cd "$2" && "$AV" "$3" "$P/o" 2>"$P/e" >/dev/null ); then
+        echo "FAIL $1: $(head -1 "$P/e")"; fail=1; return
+    fi
+    chmod +x "$P/o"; "$P/o"; local got=$?
+    [ "$got" = "$4" ] && echo "ok   $1" \
+        || { echo "FAIL $1: exit $got, wanted $4"; fail=1; }
+}
+inc "sibling include, built from the repo root" "$P"     "src/main.v0"      31
+inc "sibling include, built from src/"          "$P/src" "main.v0"          31
+inc "input path that already has a directory"   "$P"     "root.v0"          31
+inc "include in a subdirectory"                 "$P"     "src/nest.v0"      32
+inc "absolute input path"                       "/"      "$P/src/main.v0"   31
+
+if ( cd "$P" && "$AV" src/bad.v0 "$P/o" 2>"$P/e" >/dev/null ); then
+    echo "FAIL: a missing include was accepted"; fail=1
+else
+    case "$(cat "$P/e")" in
+        *nothere.v0*) echo "ok   a missing include still names the file" ;;
+        *) echo "FAIL: missing include says '$(cat "$P/e")'"; fail=1 ;;
+    esac
+fi
+
 exit $fail

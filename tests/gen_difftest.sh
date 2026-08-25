@@ -212,6 +212,17 @@ for b in $REGS; do
     done
 done
 
+# --- bare [reg], no displacement ---
+# This was a syntax error until it was not: the parser required an
+# explicit +0. rbp/r13 still need mod=01 with a zero disp8 and rsp/r12
+# still need a SIB, so the whole 16 is the test, not a sample.
+for b in $REGS; do
+    emit "mov rcx, [$b]"  "mov rcx, [$b]"
+    emit "mov [$b], rcx"  "mov [$b], rcx"
+    emit "lea rdx, [$b]"  "lea rdx, [$b]"
+    emit "movb rcx, [$b]"  "movzx rcx, byte ptr [$b]"
+done
+
 # --- near indirect jmp/call (FF /4, FF /2) ---
 # jmp reg had no encoder at all: it fell through to the label path and
 # reported `undefined label: rax`. rsp and rbp are the interesting ones

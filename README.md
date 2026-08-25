@@ -81,19 +81,27 @@ the dialect grows, so it's the source of truth, not this file. Briefly:
   expressible
 - `equ` constants (a number, a negative number, or the name of a
   constant already defined, so `B equ A` aliases), `label:` definitions,
-  `resb`
+  `resb`. Names start with a letter or underscore — `1abc:` is not a
+  label
 - `align N` — pad the current section to an N-byte boundary, N a power
   of two up to 32 (`.text` pads with `nop`, `.data` with zero, `.bss`
   just moves the cursor). A file that uses it assembles serially: what
   a chunk needs to pad depends on where the merge places it, so a
   worker reports it and the parent reassembles
-- memory operands `[base+disp]` and `[base+index*scale+disp]`
+- memory operands `[base]`, `[base+disp]` and `[base+index*scale+disp]`,
+  where a displacement may be a number or the name of an `equ` constant
+  — `[rbx+LINE_OFF]`
 - `.text`/`.data`/`.bss` — real ELF segments: R+X, RW, and a
   zero-filled RW mapping that costs nothing in the file. `.bss` takes
   only `resb`, labels and `equ`: it contributes no file bytes, so a
   `db` or an instruction there is an error rather than a byte that
   silently disappears
-- `%include "file"`, nesting supported
+- `%include "file"`, nesting supported. A relative name is tried against
+  the directory of the top-level input file first, then as written, so a
+  file in `src/` that includes a sibling builds from anywhere. That
+  directory rather than the including file's: the splice is textual and
+  happens before parsing, so by the time a nested include is reached the
+  file it came from is no longer a thing to ask about
 - `global NAME` / `extern NAME` for object output
 - `[-f elf64]`, then filenames, then a worker count
 
@@ -102,6 +110,14 @@ syntax error) and ALU ops at any width but 64 (memory access has
 `movb`/`movw`/`movd`, but `add eax, 1` is unexpressible), RIP-relative
 addressing, and short (`rel8`) jumps. That first one is the wall between
 this and assembling compiler output.
+
+Fixed ceilings, all enforced with a diagnostic rather than a truncation:
+229,376 symbols, 200,000 fixups, 64 MiB of input, 64 MiB per section, and
+a single included file up to 16 MiB. NASM and GNU `as` grow instead of
+stopping. These are a consequence of assembling inside one `mmap` with a
+fixed layout, which is also where the speed comes from — but "too many
+symbols" on a large generated file is a wall you cannot argue with, so
+it is written here rather than discovered at 200,000 labels.
 
 `rel8` is a deliberate omission. Picking it requires knowing whether the
 target is within 127 bytes, which isn't known when the instruction is

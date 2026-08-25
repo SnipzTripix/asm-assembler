@@ -70,6 +70,10 @@ echo "=== programs ==="
 run_prog hello    0
 run_prog edge     7
 run_prog sections 0
+run_prog loop     0                   # labels, cmp/jge loop, [rbp-8]
+                                      # scratch, push/pop, call/ret
+run_prog v2feat   0                   # equ, reg-imm arithmetic, bitwise,
+                                      # shifts, movb, the unsigned jcc set
 
 echo "=== data directives (dw/dd/dq, dq-label jump table) ==="
 ./tests/safe.sh ./tests/check_data_dirs.sh "$V" || fail=1
