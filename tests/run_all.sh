@@ -140,6 +140,9 @@ echo "=== parallel determinism ==="
 echo "=== cross-chunk references ==="
 ./tests/safe.sh ./tests/repro_cross.sh "$V" 400 || fail=1
 
+echo "=== the assembler's own source, through the parallel path ==="
+./tests/safe.sh ./tests/check_self_par.sh "$V" || fail=1
+
 echo "=== self-hosting fixed point ==="
 ./tests/safe.sh ./tests/fixedpoint.sh "$V" || fail=1
 
