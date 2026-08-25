@@ -25,6 +25,24 @@ fail=0
 MIN=$(grep -m1 '^PAR_MIN_BYTES' v1.v0 | awk '{print $3}')
 [ -n "$MIN" ] || { echo "FAIL: could not read PAR_MIN_BYTES from v1.v0"; exit 1; }
 
+# An `align` anywhere in the source forces the whole file onto the serial
+# path -- a worker cannot know its chunk's final base, so it reports the
+# directive and the parent throws every slot away. That is correct, and it
+# would also make everything below vacuous: -j1 through -j16 would agree
+# because they all ran serially. Measured on this source padded past the
+# threshold, -j16 with an align costs 7.3 ms against 5.7 ms serial, having
+# forked sixteen workers to discard their output.
+#
+# So: if v1.v0 ever starts using align, this test has to be rewritten, not
+# quietly kept.
+if grep -qE '^align ' "$SRC"; then
+    echo "FAIL: $SRC uses `align`, which forces the serial fallback -- every"
+    echo "     comparison below would pass without exercising the parallel"
+    echo "     path at all. Decide deliberately: drop the align, or replace"
+    echo "     this test with one that means something."
+    exit 1
+fi
+
 sz=$(wc -c < "$SRC")
 need=$(( MIN - sz + 4096 ))
 [ "$need" -lt 0 ] && need=0

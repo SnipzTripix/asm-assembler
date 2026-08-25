@@ -31,7 +31,8 @@ mode to 0755 automatically; the stdin/stdout form needs an explicit
 |---|---|
 | `v1.v0` | The assembler's own source, in its own dialect |
 | `v1` | The assembler's own binary, built from `v1.v0` |
-| `seed/` | Retired bootstrap tool (see below) — not needed to build anything |
+| `v1boot.v0` | Frozen copy of `v1.v0` in `seed`'s subset. Bootstrap only, never edited |
+| `seed/` | Hand-verified bootstrap assembler, frozen (see below) |
 | `tests/` | Regression programs, nasm differential tests, a benchmark generator |
 
 ## The bootstrap story
@@ -56,9 +57,39 @@ verified two ways before being kept:
    didn't fit in 32 bits, a couple of stale mnemonics left over from
    dialect changes).
 
-`seed` is kept, unmodified, purely as the historical record and as a
-second independent encoder to differential-test against — nothing in
-`v1` depends on it anymore. See `seed/README.md`.
+`seed` is frozen, and stays that way: every line added to `seed.asm`
+enlarges the base someone has to verify by hand. `bootstrap.sh` still
+starts from it, and `nasm` plus `seed/seed.asm` are still the only
+inputs anyone has to trust. See `seed/README.md`.
+
+That freeze used to cap the assembler's own source. `bootstrap.sh`
+required `seed` to assemble `v1.v0` directly, so `v1.v0` could only
+use forms `seed` understands — which meant `lea`, `test`, `neg`,
+`align`, `[base+index*scale+disp]`, bare `[base]`, named
+displacements, `movw`, `movd` and `jmp reg` were all implemented by
+`v1` and unusable by `v1.v0`. The assembler was not allowed to use its
+own best instructions on itself, and it showed: the source spelled out
+a base-plus-constant address in three instructions, 159 times, because
+`[rbx+LINE_OFF]` was unreachable.
+
+`v1boot.v0` resolves it. It is a frozen copy of `v1.v0` that stays
+inside `seed`'s subset forever; its only job is to produce a binary
+good enough to assemble the modern source. The chain is one link
+longer and the guarantee is unchanged:
+
+```
+nasm    seed.asm   -> seed
+seed    v1boot.v0  -> boot      (frozen, never edited)
+boot    v1.v0      -> stage1    (the whole dialect is available here)
+stage1  v1.v0      -> stage2
+stage2  v1.v0      -> stage3    and stage2 must equal stage3
+```
+
+`v1boot.v0` changes only when `v1.v0` wants a form the binary built
+from it does not implement. That is a re-freeze — copy the
+then-current `v1.v0` over it, in its own commit — not a place to fix
+bugs. A bug there is only interesting if the chain stops converging,
+and the fixed point at the end is what proves it did not matter.
 
 ## The dialect
 
@@ -289,10 +320,23 @@ as a 19% loss), and treat sub-30% differences here as unattributable
 unless the loop is pinned.
 
 `align N` exists because of that finding rather than as a feature
-request, and it is the tool for pinning it: `align 32` before a hot
-loop makes the next measurement about the change. Nothing in `v1.v0`
-uses it yet — doing that is an optimisation pass, and the point of
-having the directive first is that the pass can then be measured.
+request, and it has now been used to measure the floor rather than
+just to argue about it. One `align 32` in front of the statement loop,
+changing nothing else, moved a 1M-statement build by **+5.4%, +7.1%
+and +6.6%** across three warmed interleaved rounds. Six per cent from
+one line that emits at most 31 `nop` bytes is the noise floor made
+visible.
+
+It is not in `v1.v0`, deliberately. An `align` anywhere in a source
+forces the whole file onto the serial path — a worker cannot know its
+chunk's final base, so it reports the directive and the parent
+discards every slot. Measured on this source padded past the
+threshold, `-j16` with an align costs 7.3 ms against 5.7 ms serial,
+having forked sixteen workers to throw their output away. Six per cent
+of a 6 ms self-assembly is not worth losing the parallel path on the
+one input this project runs most, so the directive waits for a merge
+that can pad chunk starts. `tests/check_self_par.sh` fails loudly if
+`v1.v0` starts using it, rather than passing vacuously.
 
 Against the assemblers it is not trying to replace, same 3.83 MB /
 300,003-statement input, best of three:
