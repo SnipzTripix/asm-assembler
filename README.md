@@ -350,12 +350,32 @@ were found in the first place; `tests/check_reject.sh` is the asserting
 half of the same idea, and lists every input the assembler must refuse.
 
 That distinction turned out to matter. The suite was thorough about what
-the assembler *emits* — a fixed point, a 7220-instruction cross product
+the assembler *emits* — a fixed point, a 7624-instruction cross product
 against GNU `as` — and had nothing at all about what it should *refuse*,
 which is precisely the shape of the bugs it kept missing: input that
 assembles cleanly into the wrong program. Three other scripts were
 printing "DIFFERS" or "race condition" and exiting 0, so `run_all.sh`
 scrolled past them green; they assert now.
+
+There is a third shape, and it cost two bugs to learn. The suite was
+strong on each feature and strong on each invariant, but both bugs found
+most recently lived in the *product* of two features that were each well
+covered on their own: `.bss` × parallel, and the size threshold ×
+parallel. Nothing constructed the combination, so nothing ran it — every
+`.bss` input in the repository was far under the 256 KB threshold, took
+the serial fallback, and the parallel `.bss` path was never executed by a
+test at all. `tests/check_feature_matrix.sh` is that combination made
+routine: each feature, padded past `PAR_MIN_BYTES` read out of the
+source, asserted byte-identical at every worker count, run for its answer
+and checked for its segment count. It fails in three cases against the
+commit before the fix.
+
+Where a section sits in the file is part of that matrix, not a detail.
+The parallel `.bss` bug was invisible when `.bss` was written last —
+the worker's bogus size tripped the slot cap, the parent fell back to
+serial, and the output came out right by accident, with all the
+parallelism thrown away. An early draft of the matrix put its sections
+last and passed against the broken binary.
 
 ## Correctness stance
 

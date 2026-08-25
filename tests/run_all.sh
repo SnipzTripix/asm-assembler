@@ -81,6 +81,9 @@ echo "=== symbol tables near their limits, at every worker count ==="
 echo "=== .bss survives parallel assembly ==="
 ./tests/safe.sh ./tests/check_bss_par.sh "$V" || fail=1
 
+echo "=== every feature, past the parallel threshold, at every worker count ==="
+./tests/safe.sh ./tests/check_feature_matrix.sh "$V" || fail=1
+
 echo "=== equ aliases resolve the same in both paths ==="
 ./tests/safe.sh ./tests/check_equ_par.sh "$V" || fail=1
 
