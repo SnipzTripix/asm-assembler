@@ -132,6 +132,29 @@ else
     echo "ok   ./x and x recognised as the same file"
 fi
 
+echo "--- .bss holds no bytes ---"
+# .bss reserves memory and contributes nothing to the file, so an emitted
+# byte there is discarded and a fixup there names .bss as its patch site
+# -- which every patch path resolved against the .data base. `dq L` in
+# .bss overwrote a .data variable and reported nothing. The check that
+# stops it lives in check_out_bounds, which runs after the statement's
+# newline, so the line it reports is checked here too.
+P='.text\nmov rax, 60\nsyscall\n.bss\nbuf: resb 8\n'
+reject "instruction in .bss"    "$P""mov rcx, 1\n"
+reject "db in .bss"             "$P""db 1\n"
+reject "dw in .bss"             "$P""dw 1\n"
+reject "dd in .bss"             "$P""dd 1\n"
+reject "dq label in .bss"       "$P""dq buf\n"
+reject "db string in .bss"      "$P"'db "x"\n'
+for tail in 'dq buf\n' 'dq buf'; do
+    printf '%b' "$P$tail" > "$D/t.v0"
+    $V "$D/t.v0" "$D/t.bin" 2>"$D/e"
+    case "$(cat "$D/e")" in
+        *"line 6"*) echo "ok   .bss diagnostic names line 6" ;;
+        *) echo "FAIL .bss diagnostic: $(cat "$D/e") -- wanted line 6"; fail=1 ;;
+    esac
+done
+
 echo "--- still accepted: these are valid and must keep working ---"
 value  "comment after statement" 7 'mov rdi, 7   ; trailing comment\nmov rax, 60\nsyscall\n'
 value  "tabs and spaces"         9 '\tmov  rdi,\t9\n\tmov rax, 60\n\tsyscall\n'
@@ -139,5 +162,6 @@ value  "label then statement"   11 'start: mov rdi, 11\nmov rax, 60\nsyscall\n'
 value  "max shift count"         0 'mov rax, 1\nshl rax, 63\nmov rdi, 0\nmov rax, 60\nsyscall\n'
 value  "negative equ"            5 'M equ -1\nmov rdi, 4\nsub rdi, M\nmov rax, 60\nsyscall\n'
 value  "db accepts both signs"   0 'mov rdi, 0\nmov rax, 60\nsyscall\ndb -1\ndb 0xFF\n'
+value  "resb+labels+equ in .bss" 8 '.bss\nbuf: resb 8\nN equ 8\n.text\nmov rdi, N\nmov rax, 60\nsyscall\n'
 
 exit $fail

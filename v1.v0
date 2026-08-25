@@ -278,6 +278,11 @@ MEM_SCALE_OFF   equ 0xE220008            ; SIB scale field (0..3 = 1,2,4,8)
 SAVED_BSS_R15_OFF equ 0xE220010          ; .bss cursor while inactive
 BSS_VADDR_OFF   equ 0xE220018            ; where .bss lands in memory,
                                           ; relative to LOAD_BASE
+BSS_MARK_OFF    equ 0xE220020            ; where the last resb left the .bss
+                                          ; cursor. .bss holds no file bytes, so
+                                          ; anything else that moves it has
+                                          ; emitted into a buffer nothing ever
+                                          ; writes out -- see check_out_bounds
 ; --- object output (-f elf64) scratch. Only touched on that path, and
 ; lazily mapped like everything else here, so a flat build never pays a
 ; page for any of it. ---
@@ -333,7 +338,8 @@ PAR_MIN_BYTES   equ 262144               ; below ~256 KiB the fork+merge
                                           ; overhead exceeds what parallel
                                           ; assembly saves, so -j is ignored
 CHUNK_ENT       equ 64                   ; {start, end, section, first_line,
-                                          ;  text_base, data_base, 2 spare}
+                                          ;  text_base, data_base, bss_base,
+                                          ;  1 spare}
 CHUNK_SHIFT     equ 6                    ; log2(CHUNK_ENT) -- indexing uses this
                                           ; rather than a bare 6, so the stride
                                           ; and the layout cannot drift apart
@@ -371,6 +377,13 @@ SM_TEXTSZ       equ 0
 SM_DATASZ       equ 8
 SM_NSYM         equ 16
 SM_NFIX         equ 24
+SM_BSSSZ        equ 40                   ; bytes this chunk reserved in .bss.
+                                         ; A worker's .bss cursor is private
+                                         ; COW memory that dies with it, so
+                                         ; without this every resb inside a
+                                         ; worker's chunk was discarded and a
+                                         ; file whose .bss was not in the
+                                         ; final chunk lost its bss segment.
 SM_NOFIT        equ 32                   ; 1 = this chunk did not fit its
                                          ; slot. Not an error: the parent
                                          ; throws every worker's output away
@@ -909,6 +922,10 @@ add rax, SAVED_BSS_R15_OFF
 mov rcx, rbx
 add rcx, BSSBUF_OFF
 mov [rax+0], rcx
+mov rax, rbx
+add rax, BSS_MARK_OFF
+mov [rax+0], rcx                    ; no resb yet: the mark starts at the
+                                    ; buffer origin, where the cursor is
 
 ; --- fork out to the parallel driver when more than one worker was asked
 ; for. par_assemble returns only in the parent, with everything merged and
@@ -3640,6 +3657,20 @@ add rcx, DATABUF_OFF
 add rcx, DATABUF_CAP
 jmp cob_check
 cob_bss:
+; .bss reserves memory; it never contributes file bytes. A statement
+; that moved this cursor without being a resb -- an instruction, a
+; db/dw/dd/dq -- emitted into a buffer nothing ever writes out, so the
+; bytes vanish. Worse, any fixup it recorded names .bss as its patch
+; site, and every patch path resolves a non-.text site against the
+; .data base: `dq L` inside .bss silently overwrote a .data variable.
+; One check here is what makes those two-way text-or-data tests
+; correct rather than merely lucky -- a patch site genuinely cannot
+; be .bss once this is enforced.
+mov rcx, rbx
+add rcx, BSS_MARK_OFF
+mov rcx, [rcx+0]
+cmp r15, rcx
+jne die_bss_emit
 mov rcx, rbx
 add rcx, BSSBUF_OFF
 add rcx, BSSBUF_CAP
@@ -3649,7 +3680,7 @@ mov rcx, r14
 add rcx, TEXTBUF_CAP
 cob_check:
 cmp r15, rcx
-jae die_section_overflow
+jae die_cob_overflow
 pop rdx
 pop rcx
 pop rax
@@ -4545,21 +4576,19 @@ ret
 
 par_worker_emit:
 call par_worker_local_resolve
-; finalize whichever section cursor is live (mirrors resolve_fixups)
+; finalize whichever section cursor is live (mirrors resolve_fixups).
+; This was a two-way text-or-data test, so a chunk that happened to end
+; in .bss parked its BSS cursor in the DATA slot. That made data_size
+; come out as the distance between two unrelated buffers, tripped the
+; SLOT_DATA_CAP check below, and sent the whole file back to the serial
+; path -- which is why a .bss at the end of a file appeared to work
+; while a .bss anywhere else silently lost its segment.
+; sec_cursor_slot already knows all three sections; use it.
 mov rax, rbx
 add rax, CUR_SECTION_OFF
-mov rcx, [rax+0]
-cmp rcx, SEC_TEXT
-je par_we_save_text
-mov rax, rbx
-add rax, SAVED_DATA_R15_OFF
+mov rdx, [rax+0]
+call sec_cursor_slot
 mov [rax+0], r15
-jmp par_we_slot
-par_we_save_text:
-mov rax, rbx
-add rax, SAVED_TEXT_R15_OFF
-mov [rax+0], r15
-par_we_slot:
 mov rax, rbx
 add rax, MYJOB_OFF
 mov rax, [rax+0]
@@ -4611,6 +4640,22 @@ mov rsi, rbx
 add rsi, DATABUF_OFF
 mov rcx, rax
 call mem_copy
+
+; --- bss reservation ---
+; No bytes to copy: resb only moves a cursor. The SIZE still has to
+; cross, because it is what the parent turns into this chunk's bss base
+; and, summed, into the bss segment's memsz. There is no cap check to
+; make here -- a reservation costs the slot nothing, and the worker's
+; own check_out_bounds already refused anything past BSSBUF_CAP.
+mov rax, rbx
+add rax, SAVED_BSS_R15_OFF
+mov rax, [rax+0]
+mov rcx, rbx
+add rcx, BSSBUF_OFF
+sub rax, rcx                       ; bss_size
+mov rdi, [rsp+0]
+add rdi, SM_BSSSZ
+mov [rdi+0], rax
 
 ; --- defined labels ---
 mov rax, rbx
@@ -4851,6 +4896,26 @@ mov rcx, [rsp+16]                  ; text_base
 mov [rax+32], rcx
 mov rcx, [rsp+8]                   ; data_base
 mov [rax+40], rcx
+; bss_base, in the first of the entry's two spare fields. The parent's
+; own .bss cursor doubles as the running total: serial_init already left
+; it at the buffer origin, and the shared output stage reads the bss
+; size from exactly there once the merge is done, so accumulating into
+; it needs no separate publish step at the end.
+mov rcx, rbx
+add rcx, SAVED_BSS_R15_OFF
+mov rcx, [rcx+0]
+mov rdx, rbx
+add rdx, BSSBUF_OFF
+sub rcx, rdx                       ; bytes reserved by chunks before this
+mov [rax+48], rcx
+mov rax, [rsp+0]
+add rax, SM_BSSSZ
+mov rax, [rax+0]                   ; what THIS chunk reserved
+mov rcx, rbx
+add rcx, SAVED_BSS_R15_OFF
+mov rdx, [rcx+0]
+add rdx, rax
+mov [rcx+0], rdx
 
 mov rax, [rsp+0]
 mov rcx, rax
@@ -4947,11 +5012,16 @@ mov rsi, rbx
 add rsi, CHUNKTAB_OFF
 add rcx, rsi
 cmp rdi, SEC_TEXT
-jne par_merge_sym_data
-mov rsi, [rcx+32]
-jmp par_merge_sym_have
-par_merge_sym_data:
+je par_merge_sym_text
+cmp rdi, SEC_BSS
+je par_merge_sym_bss
 mov rsi, [rcx+40]
+jmp par_merge_sym_have
+par_merge_sym_bss:
+mov rsi, [rcx+48]                  ; a .bss label used to be given the
+jmp par_merge_sym_have             ; DATA base here, which put it inside
+par_merge_sym_text:                ; the RW data segment
+mov rsi, [rcx+32]
 par_merge_sym_have:
 add rdx, rsi
 mov [rax+24], rdx
@@ -5009,6 +5079,12 @@ and rax, rcx
 mov rcx, rbx
 add rcx, DATA_FILE_START_OFF
 mov [rcx+0], rax
+
+; .bss lands on the page after .data, and both inputs to that are final
+; only now. The serial path gets this from resolve_fixups, which the
+; merge does not run -- so without this call BSS_VADDR stayed zero and
+; every deferred reference to a .bss label resolved to LOAD_BASE.
+call compute_bss_vaddr
 
 mov r9, 0
 par_merge_p2:
@@ -5116,18 +5192,20 @@ par_patch:
 push r9
 push r10
 push r11
-; --- file offset of the target ---
-; a text offset is already a file offset (header+text start the file);
-; a data offset needs DATA_FILE_START added, exactly as resolve_fixups does
-mov rax, rdx
-cmp rsi, SEC_TEXT
-je par_patch_tgt_text
-mov r10, rbx
-add r10, DATA_FILE_START_OFF
-mov r10, [r10+0]
-add rax, r10
-par_patch_tgt_text:
-mov r9, rax                        ; r9 = target file offset
+; --- address of the target ---
+; a text offset is already a file offset (header+text start the file); a
+; data offset needs DATA_FILE_START; a .bss offset has no file position
+; at all and needs BSS_VADDR. sec_vaddr_base is the same three-way
+; lookup resolve_fixups uses, and going through it is what keeps the two
+; paths in agreement -- this was a two-way text-or-data test, so every
+; .bss target came out at the DATA base: inside the RW data segment,
+; mapped and writable, so the program ran and quietly corrupted .data
+; instead of faulting.
+; rdx is dead after this point, so it can carry the section argument.
+mov r9, rdx                        ; target value, section-relative
+mov rdx, rsi                       ; target section
+call sec_vaddr_base                ; rax = that section's base
+add r9, rax                        ; r9 = target address
 
 ; --- address to write, and file offset of, the patch site ---
 mov rax, rcx
@@ -7556,6 +7634,10 @@ sub rcx, r15                       ; bytes still available in .bss
 cmp rcx, rax
 jl die_section_overflow
 add r15, rax
+mov rax, rbx                       ; resb is the ONLY thing allowed to move
+add rax, BSS_MARK_OFF              ; the .bss cursor; record where it left
+mov [rax+0], r15                   ; it so check_out_bounds can tell an
+                                    ; emitted byte from a reservation
 call expect_eol
 ret
 
@@ -7696,6 +7778,31 @@ mov rdi, msg_badindex
 jmp die_at_line
 die_resb_section:
 mov rdi, msg_resbsection
+jmp die_at_line
+die_cob_overflow:
+mov rdi, msg_sectionoverflow
+jmp die_at_stmt_line
+die_bss_emit:
+mov rdi, msg_bssemit
+jmp die_at_stmt_line
+
+; die_at_stmt_line -- check_out_bounds runs after the statement's own
+; newline has been consumed, so LINE_OFF has already moved on to the
+; next line and reporting it would send the reader one line past the
+; problem. r13 sitting exactly on a line start is what says that
+; happened; at end of input with no trailing newline skip_to_eol never
+; bumped the count, r13 is not on a line start, and it is already right.
+die_at_stmt_line:
+mov rax, rbx
+add rax, LINE_START_OFF
+mov rax, [rax+0]
+cmp r13, rax
+jne die_at_line
+mov rax, rbx
+add rax, LINE_OFF
+mov rcx, [rax+0]
+sub rcx, 1
+mov [rax+0], rcx
 jmp die_at_line
 die_section_overflow:
 mov rdi, msg_sectionoverflow
@@ -7960,6 +8067,9 @@ db "v1: rsp cannot be used as an index register"
 db 0
 msg_resbsection:
 db "v1: resb is only valid in .bss"
+db 0
+msg_bssemit:
+db "v1: .bss holds no bytes -- only resb, labels and equ belong here"
 db 0
 msg_sectionoverflow:
 db "v1: section too large for its output buffer"

@@ -82,8 +82,11 @@ the dialect grows, so it's the source of truth, not this file. Briefly:
   `resb`
 - memory operands `[base+disp]` and `[base+index*scale+disp]`
 - `.text`/`.data`/`.bss` — real ELF segments: R+X, RW, and a
-  zero-filled RW mapping that costs nothing in the file. `jmp reg` is
-  not supported, though `call reg` is
+  zero-filled RW mapping that costs nothing in the file. `jmp reg`
+  is not supported, though `call reg` is. `.bss` takes only `resb`,
+  labels and `equ`: it contributes no file bytes, so a `db` or an
+  instruction there is an error rather than a byte that silently
+  disappears
 - `%include "file"`, nesting supported
 - `global NAME` / `extern NAME` for object output
 - `[-f elf64]`, then filenames, then a worker count
@@ -213,6 +216,19 @@ was under it, so the "parallel" tests had been measuring (and checking)
 the serial path. `tests/par_equiv.sh` now reads the threshold out of the
 source, generates an input past it, and asserts that CPU time exceeds
 wall time — something a serial fallback cannot fake.
+
+That threshold guards against small files, not against unhelpful
+shapes. On a source of 400,000 `jmp END` against a single label at the
+end of the file — every reference deferred to the merge, and almost no
+encoding work for a worker to do — `-j` is a **pessimisation**: 13 ms at
+`-j1` against 21 ms at `-j16`, best of five, warm. The merge's per-fixup
+work is the whole cost and the workers have nothing to amortise it
+against. It is the shape, not the deferral: 200,000 jumps to 200,000
+*distinct* far labels scale normally (53 ms → 14 ms), because there the
+symbol table work is real and parallel. Ordinary code looks like the
+second, not the first. The fix is a cheaper merge rather than a cleverer
+threshold, and until there is one, `-j` on reference-dense input with a
+tiny symbol table costs more than it saves.
 
 The ceiling is Amdahl, not contention, and it is measured rather than
 asserted: ~43% of the work is serial. A serial pre-pass has to run first
