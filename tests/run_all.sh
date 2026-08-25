@@ -78,6 +78,9 @@ echo "=== a worker count never breaks a build ==="
 echo "=== symbol tables near their limits, at every worker count ==="
 ./tests/safe.sh ./tests/check_saturation.sh "$V" || fail=1
 
+echo "=== align ==="
+./tests/safe.sh ./tests/check_align.sh "$V" || fail=1
+
 echo "=== .bss survives parallel assembly ==="
 ./tests/safe.sh ./tests/check_bss_par.sh "$V" || fail=1
 

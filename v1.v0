@@ -46,6 +46,11 @@
 ;            register form is the near indirect FF /digit), and Jcc in
 ;            all sixteen conditions: jo jno jb jae je jne jbe ja js jns
 ;            jp jnp jl jge jle jg (canonical names only, no jz/jc aliases)
+;   align N  pad the section to an N-byte boundary, N a power of two
+;            up to 32 -- HDR_LEN (288) is a multiple of 32 but not 64,
+;            so past that the flat and object formats would disagree
+;            about the same directive. nop in .text, zero in .data, a
+;            cursor move in .bss. Forces serial: see do_align
 ;   db       string with \n \t \r \0 \\ \" escapes, or a single byte
 ;   dw dd dq 2/4/8-byte values; dq also takes a label, which is what
 ;            makes a jump table expressible
@@ -284,6 +289,12 @@ BSS_MARK_OFF    equ 0xE220020            ; where the last resb left the .bss
                                           ; anything else that moves it has
                                           ; emitted into a buffer nothing ever
                                           ; writes out -- see check_out_bounds
+ALIGN_SEEN_OFF  equ 0xE220028            ; a worker met an `align`. It cannot
+                                          ; honour one: how much padding a chunk
+                                          ; needs depends on where the merge
+                                          ; places it. Reported like a chunk that
+                                          ; outgrew its slot, so the parent falls
+                                          ; back to serial
 ; --- object output (-f elf64) scratch. Only touched on that path, and
 ; lazily mapped like everything else here, so a flat build never pays a
 ; page for any of it. ---
@@ -588,6 +599,8 @@ PACK_DD         equ 0x6464
 PACK_DQ         equ 0x7164
 PACK_BSS        equ 0x737362
 PACK_RESB       equ 0x62736572
+PACK_ALIGN      equ 0x6E67696C61           ; 5 bytes, so it needs the imm64
+                                          ; load the way PACK_SYSCALL does
 PACK_GLOBAL     equ 0x6C61626F6C67
 PACK_EXTERN     equ 0x6E7265747865
 PACK_ELF64      equ 0x3436666C65         ; "elf64" plus its NUL, the only
@@ -4601,6 +4614,16 @@ mov rcx, [rcx+0]
 add rax, rcx
 push rax                           ; [rsp] = slot base, held throughout
 
+; A worker cannot honour `align`: the padding a chunk needs depends on
+; where the merge finally places it, and no worker knows that. Report it
+; the way a chunk that outgrew its slot does -- the parent discards every
+; slot and assembles serially. Only files that use the directive pay.
+mov rax, rbx
+add rax, ALIGN_SEEN_OFF
+mov rax, [rax+0]
+cmp rax, 0
+jne par_we_toobig
+
 ; --- text bytes ---
 mov rax, rbx
 add rax, SAVED_TEXT_R15_OFF
@@ -7266,12 +7289,15 @@ call swar_pack
 mov r8, rax                         ; r8 = masked packed candidate word
 movb r9, [r10+0]                    ; r9 = first byte, for bucketing
 
-cmp r9, 97                          ; 'a': add, and
+cmp r9, 97                          ; 'a': add, and, align
 jne parse_stmt_bucket_c
 cmp r8, PACK_ADD
 je parse_stmt_call_add
 cmp r8, PACK_AND
 je parse_stmt_call_and
+mov rax, PACK_ALIGN                 ; last: add and and are hot, align is not
+cmp r8, rax
+je parse_stmt_call_align
 jmp die_unknown_mnem
 
 parse_stmt_bucket_c:
@@ -7500,6 +7526,9 @@ ret
 parse_stmt_call_ret:
 call do_ret
 ret
+parse_stmt_call_align:
+call do_align
+ret
 parse_stmt_call_resb:
 call do_resb
 ret
@@ -7636,6 +7665,88 @@ ret
 sec_cursor_slot_text:
 mov rax, rbx
 add rax, SAVED_TEXT_R15_OFF
+ret
+
+
+; ===========================================================================
+; align N -- pad the current section forward to the next N-byte boundary.
+; N must be a power of two, at most 32.
+;
+; The cap is not arbitrary. In the flat format a section's virtual address
+; is LOAD_BASE (page-aligned) plus its file offset, and .text's offset
+; carries HDR_LEN. HDR_LEN is 288, a multiple of 32 but not of 64, so up
+; to 32 the section offset and the virtual address agree and there is one
+; right answer; past it the flat and object formats would need different
+; padding for the same directive. 16 -- the SysV data alignment -- and 32
+; -- the boundary a hot loop wants to sit inside, and the one the JCC
+; erratum cares about -- are what this exists for, and both fit.
+;
+; It exists because of a measurement, not a feature request: ~300 bytes of
+; unrelated .text moved self-assembly by 26%, and a 7-byte shift held the
+; difference. Until a hot loop can be pinned to a boundary, every change
+; under about 30% on this codebase is measuring placement rather than
+; itself.
+;
+; Padding is 0x90 in .text so the bytes are a legal instruction if control
+; ever reaches them, zero in .data, and nothing at all in .bss -- there
+; the cursor just moves, exactly as resb does.
+; ===========================================================================
+do_align:
+call skip_ws
+call resolve_imm_operand
+cmp rax, 1
+jl die_bad_align
+cmp rax, 32
+jg die_bad_align
+mov rcx, rax
+sub rcx, 1
+mov rdx, rax
+and rdx, rcx                       ; N & (N-1) is 0 exactly for powers of two
+cmp rdx, 0
+jne die_bad_align
+push rcx                           ; mask = N-1
+call section_base                  ; rax = section base, rdx = section id
+pop rcx
+mov rsi, r15
+sub rsi, rax
+and rsi, rcx                       ; how far past the boundary the cursor is
+cmp rsi, 0
+je do_align_flag
+mov rdi, rcx
+add rdi, 1
+sub rdi, rsi                       ; rdi = padding bytes needed, 1..N-1
+cmp rdx, SEC_BSS
+je do_align_bss
+
+mov rcx, 0                         ; .data pads with zero
+cmp rdx, SEC_TEXT
+jne do_align_fill
+mov rcx, 0x90                      ; .text pads with nop
+do_align_fill:
+movb [r15+0], rcx
+add r15, 1
+push rcx
+push rdi
+call check_out_bounds              ; up to 31 bytes from one statement is
+pop rdi                            ; more than the per-statement bound after
+pop rcx                            ; parse_stmt is meant to absorb, so the
+sub rdi, 1                         ; same check runs per byte here
+cmp rdi, 0
+jne do_align_fill
+jmp do_align_flag
+
+do_align_bss:
+add r15, rdi
+mov rax, rbx
+add rax, BSS_MARK_OFF
+mov [rax+0], r15                   ; a reservation, not an emission: the
+                                    ; cursor moved, no bytes were written
+do_align_flag:
+mov rax, rbx
+add rax, ALIGN_SEEN_OFF
+mov rcx, 1
+mov [rax+0], rcx                   ; read by par_worker_emit; see there
+call expect_eol
 ret
 
 ; ===========================================================================
@@ -7814,6 +7925,9 @@ jmp die_at_line
 die_cob_overflow:
 mov rdi, msg_sectionoverflow
 jmp die_at_stmt_line
+die_bad_align:
+mov rdi, msg_badalign
+jmp die_at_line
 die_bss_emit:
 mov rdi, msg_bssemit
 jmp die_at_stmt_line
@@ -8099,6 +8213,9 @@ db "v1: rsp cannot be used as an index register"
 db 0
 msg_resbsection:
 db "v1: resb is only valid in .bss"
+db 0
+msg_badalign:
+db "v1: align takes a power of two from 1 to 32"
 db 0
 msg_bssemit:
 db "v1: .bss holds no bytes -- only resb, labels and equ belong here"

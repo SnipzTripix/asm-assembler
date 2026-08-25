@@ -82,6 +82,11 @@ the dialect grows, so it's the source of truth, not this file. Briefly:
 - `equ` constants (a number, a negative number, or the name of a
   constant already defined, so `B equ A` aliases), `label:` definitions,
   `resb`
+- `align N` — pad the current section to an N-byte boundary, N a power
+  of two up to 32 (`.text` pads with `nop`, `.data` with zero, `.bss`
+  just moves the cursor). A file that uses it assembles serially: what
+  a chunk needs to pad depends on where the merge places it, so a
+  worker reports it and the parent reassembles
 - memory operands `[base+disp]` and `[base+index*scale+disp]`
 - `.text`/`.data`/`.bss` — real ELF segments: R+X, RW, and a
   zero-filled RW mapping that costs nothing in the file. `.bss` takes
@@ -260,12 +265,18 @@ One caveat on all of these, learned the expensive way. This binary's
 statement loop is sensitive to where it lands in memory: adding ~300
 bytes of unrelated code elsewhere in `.text` moved self-assembly by 26%,
 and a *seven-byte* shift was enough to hold the difference. That is a hot
-loop crossing a 32-byte boundary, and the dialect has no `align`
-directive to pin it with — so any measurement of a change smaller than
-that is measuring placement, not the change. Two consequences worth
-stating: benchmark warmed and interleaved (a cold-cache run showed one
-change as a 19% win that warmed runs showed as a 19% loss), and treat
-sub-30% differences here as unattributable until `align` exists.
+loop crossing a 32-byte boundary — so any measurement of a change
+smaller than that is measuring placement, not the change. Two
+consequences worth stating: benchmark warmed and interleaved (a
+cold-cache run showed one change as a 19% win that warmed runs showed
+as a 19% loss), and treat sub-30% differences here as unattributable
+unless the loop is pinned.
+
+`align N` exists because of that finding rather than as a feature
+request, and it is the tool for pinning it: `align 32` before a hot
+loop makes the next measurement about the change. Nothing in `v1.v0`
+uses it yet — doing that is an optimisation pass, and the point of
+having the directive first is that the pass can then be measured.
 
 Against the assemblers it is not trying to replace, same 3.83 MB /
 300,003-statement input, best of three:
